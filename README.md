@@ -1,54 +1,96 @@
-# FT8 (and now FT4) library 
+# FT8/FT4 Decoder - ESP32 + Linux
 
-C implementation of a lightweight FT8/FT4 decoder and encoder, mostly intended for experimental use on microcontrollers.
+Upstream reference (original work): Karlis Goba (YL3JG), repository: https://github.com/kgoba/ft8_lib
 
-The intent of this library is to allow FT8/FT4 encoding and decoding in standalone environments (i.e. without a PC or RPi), e.g. automated beacons or SDR transceivers. It's also my learning process, optimization problem and source of fun.
+This repository is a PlatformIO-focused adaptation of that FT8/FT4 decoder, set up to run with one shared application entrypoint on:
 
-The encoding process is relatively light on resources, and an Arduino should be perfectly capable of running this code.
+- ESP32-S3 (Arduino framework)
+- Linux host (PlatformIO native environment)
 
-The decoder is designed with memory and computing efficiency in mind, in order to be usable with a fast enough microcontroller. It is shown to be working on STM32F7 boards fast enough for real work, but the embedded application itself is beyond this repository. This repository provides an example decoder which can decode a 15-second WAV file on a desktop machine or SBC. The decoder needs to access the whole 15-second window in spectral magnitude representation (the window can be also shorter, and messages can have varying starting time within the window). The example FT8 decoder can work with slightly less than 200 KB of RAM. 
+## What this repo is for
 
-# Current state
+- Decode FT8/FT4 from WAV files on ESP32-S3 using LittleFS storage.
+- Run the same decode application logic on Linux for fast testing.
+- Keep the decoder core in C (`src/decode_ft8.c`, `ft8/`, `fft/`, `common/`) and use thin platform-specific glue in `src/main.cpp`.
 
-Currently the basic message set for establishing QSOs, as well as telemetry and free-text message modes are supported:
-* CQ {call} {grid}, e.g. CQ CA0LL GG77
-* CQ {xy} {call} {grid}, e.g. CQ JA CA0LL GG77
-* {call} {call} {report}, e.g. CA0LL OT7ER R-07
-* {call} {call} 73/RRR/RR73, e.g. OT7ER CA0LL 73
-* Free-text messages (up to 13 characters from a limited alphabet) (decoding only, untested)
-* Telemetry data (71 bits as 18 hex symbols)
+## Project layout (important parts)
 
-Encoding and decoding works for both FT8 and FT4. For encoding and decoding, there is a console application provided for each, which serves mostly as test code, and could be a starting point for your potential application on an MCU. The console apps should run perfectly well on a RPi or a PC/Mac. I don't provide a concrete example for a particular MCU hardware here, since it would be very specific.
+- `src/main.cpp`: Cross-platform app entrypoint
+	- ESP32 path: scans LittleFS and decodes WAV files
+	- Linux path: decodes the WAV path passed on command line
+- `src/decode_ft8.c`: Main decoder processing implementation (`process_buffer`)
+- `ft8/`, `fft/`, `common/`: Decoder/FFT/support code
+- `tests/`: WAV test assets (kept intentionally)
+- `data/`: Files packaged into LittleFS image for ESP32
+- `platformio.ini`: Build environments and flags
+- `utils/pio_sources.py`: Adds non-`src/` core sources to PlatformIO build
+- `utils/pio_littlefs.py`: Controls WAV staging behavior for LittleFS image
 
-The code is not yet really a library, rather a collection of routines and example code.
+## Build and run
 
-# Future ideas
+### Linux host (native)
 
-Incremental decoding (processing during the 15 second window) is something that I would like to explore, but haven't started.
+Build:
 
-These features are low on my priority list:
-* Contest modes
-* Compound callsigns with country prefixes and special callsigns
+```bash
+pio run --environment native
+```
 
-# What to do with it
+Run:
 
-You can generate 15-second WAV files with your own messages as a proof of concept or for testing purposes. They can either be played back or opened directly from WSJT-X. To do that, run ```make```. Then run ```gen_ft8``` (run it without parameters to check what parameters are supported). Currently messages are modulated at 1000-1050 Hz.
+```bash
+./.pio/build/native/program tests/CQIW5ALZ.wav 14.074
+```
 
-You can decode 15-second (or shorter) WAV files with ```decode_ft8```. This is only an example application and does not support live processing/recording. For that you could use third party code (PortAudio, for example).
+The output includes decoded messages plus decode execution time.
 
-# References and credits
+### ESP32-S3 (Arduino)
 
-Thanks goes out to:
-* my contributors who have provided me with various improvements which have often been beyond my skill set.
-* Robert Morris, AB1HL, whose Python code (https://github.com/rtmrtmrtmrtm/weakmon) inspired this and helped to test various parts of the code.
-* Mark Borgerding for his FFT implementation (https://github.com/mborgerding/kissfft). I have included a portion of his code.
-* WSJT-X authors, who developed a very interesting and novel communications protocol
+Build firmware:
 
-The details of FT4 and FT8 procotols and decoding/encoding are described here: https://physics.princeton.edu/pulsar/k1jt/FT4_FT8_QEX.pdf
+```bash
+pio run --environment esp32s3
+```
 
-The public part of FT4/FT8 implementation is included in this repository under ft4_ft8_public.
+Upload LittleFS image (`data/` contents):
 
-Of course in moments of frustration I have looked up the original WSJT-X code, which is mostly written in Fortran (http://physics.princeton.edu/pulsar/K1JT/wsjtx.html). However, this library contains my own original DSP routines and a different implementation of the decoder which is suitable for resource-constrained embedded environments.
+```bash
+pio run --environment esp32s3 --target uploadfs --upload-port /dev/ttyACM1
+```
 
-Karlis Goba,
-YL3JG
+Upload firmware:
+
+```bash
+pio run --environment esp32s3 --target upload --upload-port /dev/ttyACM1
+```
+
+Monitor serial output:
+
+```bash
+pio device monitor --port /dev/ttyACM1 --baud 115200
+```
+
+## LittleFS WAV staging behavior
+
+`utils/pio_littlefs.py` works as follows:
+
+- If `FT8_WAV_FILE` is set, that WAV is copied into `data/`.
+- Else if `data/` already contains `.wav`, they are kept as-is.
+- Else one WAV is auto-staged from available test assets.
+
+Example forcing a specific file:
+
+```bash
+FT8_WAV_FILE=tests/191111_110130.wav pio run --environment esp32s3 --target uploadfs --upload-port /dev/ttyACM1
+```
+
+## Notes
+
+- Decoding is demonstrated end-to-end on ESP32-S3 and Linux.
+- If output timestamps show `1900/...`, UTC metadata is not yet being populated in the decode context.
+
+## Credits
+
+- Karlis Goba (YL3JG) for the original `ft8_lib` project and core implementation direction.
+- Mark Borgerding for KissFFT: https://github.com/mborgerding/kissfft
+- WSJT-X authors for FT8/FT4 protocol ecosystem.

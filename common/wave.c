@@ -1,3 +1,7 @@
+// common/wave.c — POSIX/Linux WAV I/O.  Not compiled on Arduino/ESP32;
+// the LittleFS WAV loader in src/main.cpp is used instead.
+#ifndef ARDUINO_ARCH_ESP32
+
 #define _GNU_SOURCE 1
 #include "wave.h"
 
@@ -229,3 +233,5 @@ int load_wav(float **signal, int* num_frames, int *num_channels, int* sample_rat
     fclose(f);
   return -1;
 }
+
+#endif /* !ARDUINO_ARCH_ESP32 */
