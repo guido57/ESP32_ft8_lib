@@ -364,14 +364,23 @@ static double elapsed_ms(const struct timespec *t0, const struct timespec *t1)
   return (double)sec * 1000.0 + (double)nsec / 1000000.0;
 }
 
+// ------------------------------------------------------------------------------------
 // Process a buffer already loaded from a file
 // Pass precise time of signal[0] (including fractional second) so we can reference to it
+// ------------------------------------------------------------------------------------
 int process_buffer(float const *signal,int sample_rate, int num_samples, bool is_ft8, float base_freq, struct tm const *tmp, double sec){
   assert(signal != NULL && tmp != NULL);
 
+  struct timespec t_wf0 = {0};
+  struct timespec t_wf1 = {0};
+  struct timespec t_dec0 = {0};
+  struct timespec t_dec1 = {0};
+
   LOG(LOG_INFO, "Sample rate %d Hz, %d samples, %.3f seconds\n", sample_rate, num_samples, (double)num_samples / sample_rate);
 
-  // Compute FFT over the whole signal and store it
+  clock_gettime(CLOCK_MONOTONIC, &t_wf0);
+
+  // Compute Waterfall accumulation (FFT)
   monitor_t mon = {0};
   monitor_config_t const mon_cfg = {
     .f_min = 100,
@@ -382,27 +391,20 @@ int process_buffer(float const *signal,int sample_rate, int num_samples, bool is
     .protocol = is_ft8 ? PROTO_FT8 : PROTO_FT4
   };
 
-  struct timespec t_wf0 = {0};
-  struct timespec t_wf1 = {0};
-  struct timespec t_dec0 = {0};
-  struct timespec t_dec1 = {0};
-
   monitor_init(&mon, &mon_cfg);
   LOG(LOG_DEBUG, "Waterfall allocated %d blocks of size %d\n", mon.wf.max_blocks, mon.block_size);
-  clock_gettime(CLOCK_MONOTONIC, &t_wf0);
-  for (int frame_pos = 0; frame_pos + mon.block_size <= num_samples; frame_pos += mon.block_size)
-    {
+  for (int frame_pos = 0; frame_pos + mon.block_size <= num_samples; frame_pos += mon.block_size){
       // Process the waveform data frame by frame - you could have a live loop here with data from an audio device
       // (cool, now that we can get sample timings - KA9Q)
       monitor_process(&mon, signal + frame_pos);
-    }
-  clock_gettime(CLOCK_MONOTONIC, &t_wf1);
-  LOG(LOG_DEBUG, "Waterfall accumulated %d symbols\n", mon.wf.num_blocks);
+  }
+
+ clock_gettime(CLOCK_MONOTONIC, &t_wf1);
   LOG(LOG_INFO, "Waterfall accumulation: %d blocks in %.3f ms\n", mon.wf.num_blocks, elapsed_ms(&t_wf0, &t_wf1));
   LOG(LOG_INFO, "Max magnitude: %.1f dB\n", mon.max_mag);
+  
   float const noise_power = estimate_global_noise_power(&mon.wf);
-
-  clock_gettime(CLOCK_MONOTONIC, &t_dec0);
+  
   // Find top candidates by Costas sync score and localize them in time and frequency
   int const candidate_size = (mon_cfg.f_max * kMax_candidates) / 3000; // Scale by bandwidth relative to the original 3 kHz
   candidate_t candidate_list[candidate_size];
@@ -415,12 +417,14 @@ int process_buffer(float const *signal,int sample_rate, int num_samples, bool is
   // Pointer to kMax_decoded_messsages-element array of pointers to message_t structures
   message_t **decoded_hashtable = calloc(sizeof(message_t *), kMax_decoded_messages);
 
+  clock_gettime(CLOCK_MONOTONIC, &t_dec0);
+  LOG(LOG_DEBUG, "Found %d candidates with score from %d in %.3f milliseconds\n", num_candidates, kMin_score, elapsed_ms(&t_wf1, &t_dec0));
+
   // Go over candidates and attempt to decode messages
-  for (int idx = 0; idx < num_candidates; ++idx)
-    {
+  for (int idx = 0; idx < num_candidates; ++idx){
       const candidate_t* cand = &candidate_list[idx];
       if (cand->score < kMin_score)
-	continue;
+	      continue;
 
       float const freq_hz = (cand->freq_offset + (float)cand->freq_sub / mon.wf.freq_osr) / mon.symbol_period;
       float const time_sec = (cand->time_offset + (float)cand->time_sub / mon.wf.time_osr) * mon.symbol_period;
@@ -428,23 +432,17 @@ int process_buffer(float const *signal,int sample_rate, int num_samples, bool is
       message_t message = {0}; // Written by ft8_decode()
       decode_status_t status = {0}; // ditto
       uint8_t plain174[FTX_LDPC_N];
-      if (!ft8_decode(&mon.wf, cand, &message, kLDPC_iterations, &status, plain174))
-        {
-	  // printf("000000 %3d %+4.2f %4.0f ~  ---\n", cand->score, time_sec, freq_hz);
-	  if (status.ldpc_errors > 0)
-            {
-	      LOG(LOG_DEBUG, "LDPC decode: %d errors\n", status.ldpc_errors);
-            }
-	  else if (status.crc_calculated != status.crc_extracted)
-            {
-	      LOG(LOG_DEBUG, "CRC mismatch!\n");
-            }
-	  else if (status.unpack_status != 0)
-            {
-	      LOG(LOG_DEBUG, "Error while unpacking!\n");
-            }
-	  continue;
+      if (!ft8_decode(&mon.wf, cand, &message, kLDPC_iterations, &status, plain174)){
+	      // printf("000000 %3d %+4.2f %4.0f ~  ---\n", cand->score, time_sec, freq_hz);
+        if (status.ldpc_errors > 0){
+          LOG(LOG_DEBUG, "LDPC decode: %d errors\n", status.ldpc_errors);
+        }else if (status.crc_calculated != status.crc_extracted){
+          LOG(LOG_DEBUG, "CRC mismatch!\n");
+        }else if (status.unpack_status != 0){
+          LOG(LOG_DEBUG, "Error while unpacking!\n");
         }
+        continue;
+      }
 
       message.freq_hz = freq_hz; // Save so we can sort on it and display it
       message.time_sec = time_sec; // Time offset of start from nominal UTC :00/:15/:30/:45 or :00/:07.5/:15/...
@@ -464,38 +462,32 @@ int process_buffer(float const *signal,int sample_rate, int num_samples, bool is
       int idx_hash = message.hash % kMax_decoded_messages;
       bool found_empty_slot = false;
       bool found_duplicate = false;
-      do
-        {
-	  if (decoded_hashtable[idx_hash] == NULL)
-            {
-	      LOG(LOG_DEBUG, "Found an empty slot\n");
-	      found_empty_slot = true;
-            }
-	  else if ((decoded_hashtable[idx_hash]->hash == message.hash) && (0 == strcmp(decoded_hashtable[idx_hash]->text, message.text)))
-            {
-	      LOG(LOG_DEBUG, "Found a duplicate [%s]\n", message.text);
-	      found_duplicate = true;
-            }
-	  else
-            {
-	      LOG(LOG_DEBUG, "Hash table clash!\n");
-	      // Move on to check the next entry in hash table
-	      idx_hash = (idx_hash + 1) % kMax_decoded_messages;
-            }
-        } while (!found_empty_slot && !found_duplicate);
-
-      if (found_empty_slot)
-        {
-	  // Fill the empty hashtable slot
-	  decoded[idx_hash] = message;
-	  decoded_hashtable[idx_hash] = &decoded[idx_hash];
-	  ++num_decoded;
-
+      do{
+        if (decoded_hashtable[idx_hash] == NULL){
+            LOG(LOG_DEBUG, "Found an empty slot\n");
+            found_empty_slot = true;
+        }else if ((decoded_hashtable[idx_hash]->hash == message.hash) && (0 == strcmp(decoded_hashtable[idx_hash]->text, message.text))){
+            LOG(LOG_DEBUG, "Found a duplicate [%s]\n", message.text);
+            found_duplicate = true;
+        }else{
+            LOG(LOG_DEBUG, "Hash table clash!\n");
+            // Move on to check the next entry in hash table
+            idx_hash = (idx_hash + 1) % kMax_decoded_messages;
         }
-    }
+      } while (!found_empty_slot && !found_duplicate);
+
+      if (found_empty_slot){
+        // Fill the empty hashtable slot
+        decoded[idx_hash] = message;
+        decoded_hashtable[idx_hash] = &decoded[idx_hash];
+        ++num_decoded;
+      }
+  }
+  
   clock_gettime(CLOCK_MONOTONIC, &t_dec1);
-  LOG(LOG_INFO, "Waterfall decode: %d candidates, %d messages in %.3f ms\n", num_candidates, num_decoded, elapsed_ms(&t_dec0, &t_dec1));
+  LOG(LOG_INFO, "On %d candidates, decoded %d messages in %.3f ms\n", num_candidates, num_decoded, elapsed_ms(&t_dec0, &t_dec1));
   LOG(LOG_INFO, "Decoded %d messages\n", num_decoded);
+  
   // Decoded messages are spread throughout hash table, so sort the whole thing including null entries
   qsort(decoded_hashtable, kMax_decoded_messages, sizeof *decoded_hashtable, mcompare);
   // Empty entries sorted to top, so first num_decoded elements of decoded_hashtable are valid
