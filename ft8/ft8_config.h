@@ -12,6 +12,11 @@
 //   FT8_MAX_DECODED_MSGS 1000
 //   FT8_FREQ_OSR            2
 //   FT8_TIME_OSR            2
+//   FT8_SNR_RAW_SCALE     0.80
+//   FT8_SNR_SCORE_SCALE   0.00
+//   FT8_SNR_OFFSET      -29.00
+//   FT8_SNR_MIN_DB      -30.00
+//   FT8_SNR_MAX_DB       20.00
 //
 // Suggested ESP32-S3 starting profile (tune up from here):
 //   -DFT8_MAX_CANDIDATES=50
@@ -40,6 +45,26 @@
 
 #ifndef FT8_TIME_OSR
 #define FT8_TIME_OSR 2
+#endif
+
+#ifndef FT8_SNR_RAW_SCALE
+#define FT8_SNR_RAW_SCALE 0.80f
+#endif
+
+#ifndef FT8_SNR_SCORE_SCALE
+#define FT8_SNR_SCORE_SCALE 0.00f
+#endif
+
+#ifndef FT8_SNR_OFFSET
+#define FT8_SNR_OFFSET -29.00f
+#endif
+
+#ifndef FT8_SNR_MIN_DB
+#define FT8_SNR_MIN_DB -30.00f
+#endif
+
+#ifndef FT8_SNR_MAX_DB
+#define FT8_SNR_MAX_DB 20.00f
 #endif
 
 #endif // FT8_CONFIG_H

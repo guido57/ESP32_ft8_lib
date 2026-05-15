@@ -50,6 +50,8 @@ extern "C"
       float freq_hz;   // We will sort on this
       float time_sec;
       int score;
+    float snr_raw_db;
+    float snr_db;
     } message_t;
 
     /// Structure that contains the status of various steps during decoding of a message
@@ -77,8 +79,9 @@ extern "C"
     /// @param[out] message message_t structure that will receive the decoded message
     /// @param[in] max_iterations Maximum allowed LDPC iterations (lower number means faster decode, but less precise)
     /// @param[out] status decode_status_t structure that will be filled with the status of various decoding steps
+    /// @param[out] plain Optional pointer to receive the decoded 174-bit codeword (0/1 bytes)
     /// @return True if the decoding was successful, false otherwise (check status for details)
-    bool ft8_decode(const waterfall_t* power, const candidate_t* cand, message_t* message, int max_iterations, decode_status_t* status);
+    bool ft8_decode(const waterfall_t* power, const candidate_t* cand, message_t* message, int max_iterations, decode_status_t* status, uint8_t* plain);
 
 #ifdef __cplusplus
 }

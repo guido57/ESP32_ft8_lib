@@ -6,6 +6,7 @@
 
 #include <stdbool.h>
 #include <math.h>
+#include <stddef.h>
 
 /// Compute log likelihood log(p(1) / p(0)) of 174 message bits for later use in soft-decision LDPC decoding
 /// @param[in] wf Waterfall data collected during message slot
@@ -313,7 +314,7 @@ static void ftx_normalize_logl(float* log174)
     }
 }
 
-bool ft8_decode(const waterfall_t* wf, const candidate_t* cand, message_t* message, int max_iterations, decode_status_t* status)
+bool ft8_decode(const waterfall_t* wf, const candidate_t* cand, message_t* message, int max_iterations, decode_status_t* status, uint8_t* plain)
 {
     float log174[FTX_LDPC_N]; // message bits encoded as likelihood
     if (wf->protocol == PROTO_FT4)
@@ -358,6 +359,14 @@ bool ft8_decode(const waterfall_t* wf, const candidate_t* cand, message_t* messa
         // the assembled 77-bit message is bitwise exclusive-OR’ed with [a] pseudorandom sequence before computing the CRC and FEC parity bits'
         for (int i = 0; i < 10; ++i)
         {
+
+        if (plain != NULL)
+        {
+            for (int i = 0; i < FTX_LDPC_N; ++i)
+            {
+                plain[i] = plain174[i];
+            }
+        }
             a91[i] ^= kFT4_XOR_sequence[i];
         }
     }

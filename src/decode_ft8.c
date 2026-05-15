@@ -10,27 +10,31 @@
 #include <stdbool.h>
 #include <libgen.h>
 #include <assert.h>
+#include <time.h>
 
 #include "ft8/decode.h"
 #include "ft8/constants.h"
+#include "ft8/ft8_config.h"
 
 #include "common/wave.h"
 #include "common/debug.h"
 #include "fft/kiss_fftr.h"
 #include "fft/kiss_fft.h"
 
-#define LOG_LEVEL LOG_FATAL
+#ifndef LOG_LEVEL
+#define LOG_LEVEL LOG_DEBUG
+#endif
 
-const int kMin_score = 10; // Minimum sync score threshold for candidates
-const int kMax_candidates = 120; // for 12 kHz sample rate; scaled for other sample rates
-const int kLDPC_iterations = 20;
+const int kMin_score = FT8_MIN_SCORE; // Minimum sync score threshold for candidates
+const int kMax_candidates = FT8_MAX_CANDIDATES; // for 12 kHz sample rate; scaled for other sample rates
+const int kLDPC_iterations = FT8_LDPC_ITERATIONS;
 
 // This used to be 50. We're now looking at some wider bandwidths *and* FT8 is pretty popular
 // Making this bigger seems to only cost memory, which I now allocate from the heap, so what the hell
-const int kMax_decoded_messages = 1000;
+const int kMax_decoded_messages = FT8_MAX_DECODED_MSGS;
 
-const int kFreq_osr = 2; // Frequency oversampling rate (bin subdivision)
-const int kTime_osr = 2; // Time oversampling rate (symbol subdivision)
+const int kFreq_osr = FT8_FREQ_OSR; // Frequency oversampling rate (bin subdivision)
+const int kTime_osr = FT8_TIME_OSR; // Time oversampling rate (symbol subdivision)
 static float hann_i(int i, int N)
 {
     float x = sinf((float)M_PI * i / N);
@@ -99,6 +103,8 @@ typedef struct
     float fft_norm;      ///< FFT normalization factor
     float* window;       ///< Window function for STFT analysis (nfft samples)
     float* last_frame;   ///< Current STFT analysis frame (nfft samples)
+    kiss_fft_scalar* timedata; ///< FFT input scratch buffer (nfft samples)
+    kiss_fft_cpx* freqdata;    ///< FFT output scratch buffer (nfft/2+1 samples)
     waterfall_t wf;      ///< Waterfall object
     float max_mag;       ///< Maximum detected magnitude (debug stats)
 
@@ -107,6 +113,10 @@ typedef struct
     kiss_fftr_cfg fft_cfg; ///< Kiss FFT housekeeping object
 } monitor_t;
 
+// Iinitialize a monitor_t structure based on the provided configuration (monitor_config_t). 
+// It calculates DSP parameters, allocates memory for FFT processing and windowing, 
+// sets up a waterfall display, and logs key initialization details, 
+//preparing the monitor for signal processing tasks.
 void monitor_init(monitor_t* me, const monitor_config_t* cfg)
 {
     float slot_time = (cfg->protocol == PROTO_FT4) ? FT4_SLOT_TIME : FT8_SLOT_TIME;
@@ -128,6 +138,8 @@ void monitor_init(monitor_t* me, const monitor_config_t* cfg)
         // me->window[i] = (i < len_window) ? hann_i(i, len_window) : 0;
     }
     me->last_frame = (float *)malloc(me->nfft * sizeof(me->last_frame[0]));
+    me->timedata = (kiss_fft_scalar*)malloc(me->nfft * sizeof(me->timedata[0]));
+    me->freqdata = (kiss_fft_cpx*)malloc((me->nfft / 2 + 1) * sizeof(me->freqdata[0]));
 
     size_t fft_work_size;
     kiss_fftr_alloc(me->nfft, 0, 0, &fft_work_size);
@@ -138,6 +150,7 @@ void monitor_init(monitor_t* me, const monitor_config_t* cfg)
     LOG(LOG_DEBUG, "FFT work area = %zu\n", fft_work_size);
 
     me->fft_work = malloc(fft_work_size);
+    LOG(LOG_DEBUG, "init FFT for %d points work area allocated at %p\n", me->nfft, me->fft_work);
     me->fft_cfg = kiss_fftr_alloc(me->nfft, 0, me->fft_work, &fft_work_size);
 
     const int max_blocks = (int)(slot_time / symbol_period);
@@ -153,16 +166,25 @@ void monitor_free(monitor_t* me)
 {
     waterfall_free(&me->wf);
     free(me->fft_work);
+  free(me->freqdata);
+  free(me->timedata);
     free(me->last_frame);
     free(me->window);
 }
 
 // Compute FFT magnitudes (log wf) for a frame in the signal and update waterfall data
+// Processes a frame of signal data by performing FFT-based analysis, 
+// computing magnitudes in decibels, and updating the waterfall data structure with scaled values. 
+// It handles time and frequency oversampling, applies a window function, 
+// and ensures the results are clamped to an 8-bit range while tracking 
+// the maximum magnitude observed.
 void monitor_process(monitor_t* me, const float* frame)
 {
     // Check if we can still store more waterfall data
     if (me->wf.num_blocks >= me->wf.max_blocks)
         return;
+  if (me->timedata == NULL || me->freqdata == NULL)
+    return;
 
     int offset = me->wf.num_blocks * me->wf.block_stride;
     int frame_pos = 0;
@@ -170,10 +192,7 @@ void monitor_process(monitor_t* me, const float* frame)
     // Loop over block subdivisions
     for (int time_sub = 0; time_sub < me->wf.time_osr; ++time_sub)
     {
-        kiss_fft_scalar timedata[me->nfft];
-        kiss_fft_cpx freqdata[me->nfft / 2 + 1];
-
-        // Shift the new data into analysis frame
+      // Shift the new data into analysis frame
         for (int pos = 0; pos < me->nfft - me->subblock_size; ++pos)
         {
             me->last_frame[pos] = me->last_frame[pos + me->subblock_size];
@@ -187,10 +206,10 @@ void monitor_process(monitor_t* me, const float* frame)
         // Compute windowed analysis frame
         for (int pos = 0; pos < me->nfft; ++pos)
         {
-            timedata[pos] = me->fft_norm * me->window[pos] * me->last_frame[pos];
+          me->timedata[pos] = me->fft_norm * me->window[pos] * me->last_frame[pos];
         }
 
-        kiss_fftr(me->fft_cfg, timedata, freqdata);
+        kiss_fftr(me->fft_cfg, me->timedata, me->freqdata);
 
         // Loop over two possible frequency bin offsets (for averaging)
         for (int freq_sub = 0; freq_sub < me->wf.freq_osr; ++freq_sub)
@@ -198,7 +217,7 @@ void monitor_process(monitor_t* me, const float* frame)
             for (int bin = 0; bin < me->wf.num_bins; ++bin)
             {
                 int src_bin = (bin * me->wf.freq_osr) + freq_sub;
-                float mag2 = (freqdata[src_bin].i * freqdata[src_bin].i) + (freqdata[src_bin].r * freqdata[src_bin].r);
+                float mag2 = (me->freqdata[src_bin].i * me->freqdata[src_bin].i) + (me->freqdata[src_bin].r * me->freqdata[src_bin].r);
                 float db = 10.0f * log10f(1E-12f + mag2);
                 // Scale decibels to unsigned 8-bit range and clamp the value
                 // Range 0-240 covers -120..0 dB in 0.5 dB steps
@@ -240,6 +259,111 @@ int mcompare(void const *a, void const *b){
   return 0;
 }
 
+static float mag_u8_to_power(uint8_t mag)
+{
+  // In monitor_process(): mag ~= 2*db + 240, where db = 10*log10(power)
+  float db = 0.5f * ((float)mag - 240.0f);
+  return powf(10.0f, db / 10.0f);
+}
+
+static float estimate_global_noise_power(const waterfall_t *wf)
+{
+  int hist[256] = {0};
+  int total = wf->num_blocks * wf->block_stride;
+  if (total <= 0)
+    return 1e-12f;
+
+  const uint8_t *p = wf->mag;
+  for (int i = 0; i < total; ++i)
+    ++hist[p[i]];
+
+  // Use a lower percentile as robust noise-floor proxy, avoiding signal peaks.
+  int target = (int)(0.35f * total);
+  int acc = 0;
+  int mag_floor = 0;
+  for (int m = 0; m < 256; ++m)
+  {
+    acc += hist[m];
+    if (acc >= target)
+    {
+      mag_floor = m;
+      break;
+    }
+  }
+
+  return mag_u8_to_power((uint8_t)mag_floor);
+}
+
+static float estimate_candidate_snr_db_2500(const waterfall_t *wf, const candidate_t *cand, const uint8_t *plain, float noise_power)
+{
+  float sum_sig = 0.0f;
+  int n_sig = 0;
+  int base = (cand->time_offset * wf->time_osr) + cand->time_sub;
+  base = (base * wf->freq_osr) + cand->freq_sub;
+  base = (base * wf->num_bins) + cand->freq_offset;
+
+  if (wf->protocol == PROTO_FT8)
+  {
+    for (int k = 0; k < FT8_ND; ++k)
+    {
+      int sym_idx = k + ((k < 29) ? 7 : 14);
+      int block_abs = cand->time_offset + sym_idx;
+      if (block_abs < 0 || block_abs >= wf->num_blocks)
+        continue;
+
+      int bit_idx = 3 * k;
+      int g = ((plain[bit_idx + 0] & 1) << 2) |
+              ((plain[bit_idx + 1] & 1) << 1) |
+              ((plain[bit_idx + 2] & 1) << 0);
+      int tone = kFT8_Gray_map[g & 7];
+
+      const uint8_t *p = wf->mag + base + (sym_idx * wf->block_stride);
+      sum_sig += mag_u8_to_power(p[tone]);
+      ++n_sig;
+    }
+  }
+  else
+  {
+    for (int k = 0; k < FT4_ND; ++k)
+    {
+      int sym_idx = k + ((k < 29) ? 5 : ((k < 58) ? 9 : 13));
+      int block_abs = cand->time_offset + sym_idx;
+      if (block_abs < 0 || block_abs >= wf->num_blocks)
+        continue;
+
+      int bit_idx = 2 * k;
+      int g = ((plain[bit_idx + 0] & 1) << 1) |
+              ((plain[bit_idx + 1] & 1) << 0);
+      int tone = kFT4_Gray_map[g & 3];
+
+      const uint8_t *p = wf->mag + base + (sym_idx * wf->block_stride);
+      sum_sig += mag_u8_to_power(p[tone]);
+      ++n_sig;
+    }
+  }
+
+  if (n_sig == 0)
+    return -99.0f;
+
+  float sig = sum_sig / n_sig;
+  float noise = (noise_power > 0.0f) ? noise_power : 1e-12f;
+  if (noise <= 0.0f)
+    return -99.0f;
+
+  // Convert local tone-group SNR to WSJT-style 2500 Hz reference.
+  // Use per-tone bin bandwidth (~6.25 Hz for FT modes), then reference to 2500 Hz.
+  float snr_bin_db = 10.0f * log10f(sig / noise + 1e-12f);
+  float snr_2500_db = snr_bin_db - 10.0f * log10f(2500.0f / 6.25f);
+  return snr_2500_db;
+}
+
+static double elapsed_ms(const struct timespec *t0, const struct timespec *t1)
+{
+  long sec = t1->tv_sec - t0->tv_sec;
+  long nsec = t1->tv_nsec - t0->tv_nsec;
+  return (double)sec * 1000.0 + (double)nsec / 1000000.0;
+}
+
 // Process a buffer already loaded from a file
 // Pass precise time of signal[0] (including fractional second) so we can reference to it
 int process_buffer(float const *signal,int sample_rate, int num_samples, bool is_ft8, float base_freq, struct tm const *tmp, double sec){
@@ -257,17 +381,28 @@ int process_buffer(float const *signal,int sample_rate, int num_samples, bool is
     .freq_osr = kFreq_osr,
     .protocol = is_ft8 ? PROTO_FT8 : PROTO_FT4
   };
+
+  struct timespec t_wf0 = {0};
+  struct timespec t_wf1 = {0};
+  struct timespec t_dec0 = {0};
+  struct timespec t_dec1 = {0};
+
   monitor_init(&mon, &mon_cfg);
-  LOG(LOG_DEBUG, "Waterfall allocated %d symbols\n", mon.wf.max_blocks);
+  LOG(LOG_DEBUG, "Waterfall allocated %d blocks of size %d\n", mon.wf.max_blocks, mon.block_size);
+  clock_gettime(CLOCK_MONOTONIC, &t_wf0);
   for (int frame_pos = 0; frame_pos + mon.block_size <= num_samples; frame_pos += mon.block_size)
     {
       // Process the waveform data frame by frame - you could have a live loop here with data from an audio device
       // (cool, now that we can get sample timings - KA9Q)
       monitor_process(&mon, signal + frame_pos);
     }
+  clock_gettime(CLOCK_MONOTONIC, &t_wf1);
   LOG(LOG_DEBUG, "Waterfall accumulated %d symbols\n", mon.wf.num_blocks);
+  LOG(LOG_INFO, "Waterfall accumulation: %d blocks in %.3f ms\n", mon.wf.num_blocks, elapsed_ms(&t_wf0, &t_wf1));
   LOG(LOG_INFO, "Max magnitude: %.1f dB\n", mon.max_mag);
+  float const noise_power = estimate_global_noise_power(&mon.wf);
 
+  clock_gettime(CLOCK_MONOTONIC, &t_dec0);
   // Find top candidates by Costas sync score and localize them in time and frequency
   int const candidate_size = (mon_cfg.f_max * kMax_candidates) / 3000; // Scale by bandwidth relative to the original 3 kHz
   candidate_t candidate_list[candidate_size];
@@ -292,7 +427,8 @@ int process_buffer(float const *signal,int sample_rate, int num_samples, bool is
 
       message_t message = {0}; // Written by ft8_decode()
       decode_status_t status = {0}; // ditto
-      if (!ft8_decode(&mon.wf, cand, &message, kLDPC_iterations, &status))
+      uint8_t plain174[FTX_LDPC_N];
+      if (!ft8_decode(&mon.wf, cand, &message, kLDPC_iterations, &status, plain174))
         {
 	  // printf("000000 %3d %+4.2f %4.0f ~  ---\n", cand->score, time_sec, freq_hz);
 	  if (status.ldpc_errors > 0)
@@ -313,6 +449,16 @@ int process_buffer(float const *signal,int sample_rate, int num_samples, bool is
       message.freq_hz = freq_hz; // Save so we can sort on it and display it
       message.time_sec = time_sec; // Time offset of start from nominal UTC :00/:15/:30/:45 or :00/:07.5/:15/...
       message.score = cand->score;
+      message.snr_raw_db = estimate_candidate_snr_db_2500(&mon.wf, cand, plain174, noise_power);
+      {
+        // Affine calibration from raw estimator to WSJT-like displayed SNR.
+        float snr = FT8_SNR_RAW_SCALE * message.snr_raw_db + FT8_SNR_SCORE_SCALE * (float)message.score + FT8_SNR_OFFSET;
+        if (snr < FT8_SNR_MIN_DB)
+          snr = FT8_SNR_MIN_DB;
+        if (snr > FT8_SNR_MAX_DB)
+          snr = FT8_SNR_MAX_DB;
+        message.snr_db = snr;
+      }
 
       LOG(LOG_DEBUG, "Checking hash table for %4.1fs / %4.1fHz [%d]...\n", time_sec, freq_hz, cand->score);
       int idx_hash = message.hash % kMax_decoded_messages;
@@ -347,6 +493,8 @@ int process_buffer(float const *signal,int sample_rate, int num_samples, bool is
 
         }
     }
+  clock_gettime(CLOCK_MONOTONIC, &t_dec1);
+  LOG(LOG_INFO, "Waterfall decode: %d candidates, %d messages in %.3f ms\n", num_candidates, num_decoded, elapsed_ms(&t_dec0, &t_dec1));
   LOG(LOG_INFO, "Decoded %d messages\n", num_decoded);
   // Decoded messages are spread throughout hash table, so sort the whole thing including null entries
   qsort(decoded_hashtable, kMax_decoded_messages, sizeof *decoded_hashtable, mcompare);
@@ -367,10 +515,10 @@ int process_buffer(float const *signal,int sample_rate, int num_samples, bool is
 	    tmp->tm_hour,
 	    tmp->tm_min,
 	    tmp->tm_sec,
-	    mp->score,
+      (int)lroundf(mp->snr_db),
 	    tbase + mp->time_sec,
 	    1.0e6 * base_freq + mp->freq_hz,
-	    mp->text);
+      mp->text);
   }
   free(decoded);
   free(decoded_hashtable);
