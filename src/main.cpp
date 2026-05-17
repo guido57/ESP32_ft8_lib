@@ -16,6 +16,7 @@
 #include <LittleFS.h>
 #include <WiFi.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 #include <freertos/task.h>
 #include <esp_heap_caps.h>
 #include <esp_timer.h>
@@ -31,6 +32,7 @@
 #endif
 
 #include "ft8/decoder_api.h"
+#include "ft8/decode.h"
 #include "common/debug.h"
 #include "secrets.h"
 
@@ -182,245 +184,561 @@ static void init_ntp()
     }
 }
 
-// WAV loader for LittleFS
-// Returns heap-allocated float samples (caller must free), or nullptr on error.
-static float* load_wav_littlefs(const char* path, int* out_num_samples, int* out_num_channels, int* out_sample_rate)
-{
-    File f = LittleFS.open(path, "r");
-    if (!f) {
-        Serial.printf("[ft8] Cannot open %s\n", path);
-        return nullptr;
-    }
-    
-    // Read and parse WAV header (RIFF container)
-    uint8_t riff_header[12];
-    if (f.read(riff_header, 12) != 12 || memcmp(riff_header, "RIFF", 4) != 0 || memcmp(riff_header + 8, "WAVE", 4) != 0) {
-        Serial.println("[ft8] Not a valid WAVE file");
-        f.close();
-        return nullptr;
-    }
-    
-    // Read chunks until we find "fmt " and "data"
-    uint8_t chunk_header[8];
-    uint32_t chunk_size;
-    uint16_t audio_format, num_channels, bits_per_sample;
-    uint32_t sample_rate;
-    bool found_fmt = false, found_data = false;
-    
-    while (f.read(chunk_header, 8) == 8) {
-        chunk_size = (chunk_header[7] << 24) | (chunk_header[6] << 16) | (chunk_header[5] << 8) | chunk_header[4];
-        
-        if (memcmp(chunk_header, "fmt ", 4) == 0) {
-            uint8_t fmt_data[16];
-            if (f.read(fmt_data, 16) != 16) break;
-            audio_format = (fmt_data[1] << 8) | fmt_data[0];
-            num_channels = (fmt_data[3] << 8) | fmt_data[2];
-            sample_rate = (fmt_data[7] << 24) | (fmt_data[6] << 16) | (fmt_data[5] << 8) | fmt_data[4];
-            bits_per_sample = (fmt_data[15] << 8) | fmt_data[14];
-            found_fmt = true;
-            if (chunk_size > 16) f.seek(f.position() + chunk_size - 16);
-        } else if (memcmp(chunk_header, "data", 4) == 0) {
-            found_data = true;
-            break;
-        } else {
-            f.seek(f.position() + chunk_size);
-        }
-    }
-    
-    if (!found_fmt || !found_data) {
-        Serial.println("[ft8] Missing fmt or data chunk");
-        f.close();
-        return nullptr;
-    }
-    
-    if (audio_format != 1 || bits_per_sample != 16) {
-        Serial.printf("[ft8] Unsupported format: %u-bit, format %u\n", bits_per_sample, audio_format);
-        f.close();
-        return nullptr;
-    }
-    
-    uint32_t num_samples = chunk_size / (num_channels * (bits_per_sample / 8));
-    float* samples = (float*)malloc(num_samples * sizeof(float));
-    if (!samples) {
-        Serial.println("[ft8] Failed to allocate sample buffer");
-        f.close();
-        return nullptr;
-    }
-    
-    int16_t raw_sample;
-    for (uint32_t i = 0; i < num_samples; i++) {
-        if (f.read((uint8_t*)&raw_sample, 2) != 2) {
-            Serial.println("[ft8] Unexpected EOF reading samples");
-            free(samples);
-            f.close();
-            return nullptr;
-        }
-        samples[i] = (float)raw_sample / 32768.0f;
-        
-        // Skip remaining channels if multichannel
-        for (int ch = 1; ch < num_channels; ch++) {
-            if (f.read((uint8_t*)&raw_sample, 2) != 2) {
-                Serial.println("[ft8] Unexpected EOF reading channels");
-                free(samples);
-                f.close();
-                return nullptr;
-            }
-        }
-    }
-    
-    f.close();
-    *out_num_samples = num_samples;
-    *out_num_channels = num_channels;
-    *out_sample_rate = sample_rate;
-    return samples;
-}
+static constexpr int kMaxWavFiles = 64;
+static constexpr int kMaxPathLen = 96;
+static constexpr int kSampleQueueDepth = 32768;
+static constexpr int kProducerPrefetchSamples = 32768;
+static constexpr int kProducerStartupPrefillSamples = 2048;
 
-static void decode_file(const char* path, float base_freq_mhz, bool is_ft8)
-{
-    Serial.printf("\n[ft8] Decoding %s (base %.3f MHz, %s)\n", path, base_freq_mhz, is_ft8 ? "FT8" : "FT4");
-    int num_samples = 0, num_channels = 0, sample_rate = 0;
-    float* signal = load_wav_littlefs(path, &num_samples, &num_channels, &sample_rate);
-    if (!signal) return;
-    
-    Serial.printf("[ft8] Loaded: %d samples @ %d Hz, %d ch, free heap: %lu bytes\n", 
-                  num_samples, sample_rate, num_channels, (unsigned long)ESP.getFreeHeap());
-    
-    ft8_decode_context_t ctx = {};
-    ctx.is_ft8 = is_ft8;
-    ctx.base_freq_mhz = base_freq_mhz;
+typedef struct {
+    ft8_stream_decoder_t* stream;
+    char path[kMaxPathLen];
+    int slot_samples;
+    int ingested_samples;
+    int blocks;
+} finalize_job_t;
 
-    const int chunk_samples = 960;
-    const int slot_samples = (int)(15.0f * sample_rate + 0.5f);
-    const int symbol_samples = (int)(0.160f * sample_rate + 0.5f);
-    const int checkpoint_samples = is_ft8 ? (79 * symbol_samples) : 0;
-    const int slots_to_run = 1; // Set to 0 to run forever on this file.
-    float* chunk = alloc_sample_buffer((size_t)chunk_samples);
-    if (!chunk) {
-        Serial.println("[ft8] Failed to allocate chunk buffer");
-        free(signal);
+static QueueHandle_t g_sample_queue = nullptr;
+static QueueHandle_t g_finalize_queue = nullptr;
+static volatile int g_active_sample_rate = 0;
+
+
+extern "C" void ft8_on_message_decoded(const char* phase,
+                                         const struct tm* utc,
+                                         double tbase_sec,
+                                         float base_freq_mhz,
+                                         const message_t* msg)
+{
+    if (phase == nullptr || utc == nullptr || msg == nullptr) {
         return;
     }
 
-    int source_pos = 0;
-    int slot_index = 0;
-    while (slots_to_run == 0 || slot_index < slots_to_run)
-    {
-        struct tm utc_now = {0};
-        double frac_now = 0.0;
-        get_utc_now(&utc_now, &frac_now);
-        double wait_sec = seconds_to_next_ft8_slot(&utc_now, frac_now);
-        if (wait_sec > 0.0) {
-            Serial.printf("[ft8] Slot %d waiting %.3f s for boundary 00/15/30/45\n", slot_index + 1, wait_sec);
-            sleep_seconds(wait_sec);
-        }
-
-        get_utc_now(&ctx.utc, &ctx.utc_frac_sec);
-        Serial.printf("[ft8] Slot %d aligned UTC start %02d:%02d:%02d.%03d\n",
-                      slot_index + 1,
-                      ctx.utc.tm_hour,
-                      ctx.utc.tm_min,
-                      ctx.utc.tm_sec,
-                      (int)(ctx.utc_frac_sec * 1000.0 + 0.5));
-
-        ft8_stream_decoder_t* stream = ft8_stream_open(sample_rate, &ctx);
-        if (stream == nullptr) {
-            Serial.println("[ft8] Failed to open stream decoder");
-            free(chunk);
-            free(signal);
-            return;
-        }
-
-        int sent = 0;
-        int blocks = 0;
-        unsigned long t0 = millis();
-        int64_t next_chunk_deadline_us = esp_timer_get_time();
-        int chunk_index = 0;
-        bool checkpoint_mark_logged = false;
-        if (checkpoint_samples > 0)
-        {
-            Serial.printf("[ft8] Slot %d checkpoint target: %d samples (%d symbols)\n",
-                          slot_index + 1,
-                          checkpoint_samples,
-                          79);
-        }
-        while (sent < slot_samples) {
-            int n = slot_samples - sent;
-            if (n > chunk_samples) {
-                n = chunk_samples;
-            }
-
-            for (int i = 0; i < n; ++i) {
-                chunk[i] = signal[source_pos++];
-                if (source_pos >= num_samples) {
-                    source_pos = 0;
-                }
-            }
-
-            Serial.printf("[ft8] Slot %d  %d..%d (%.2f%%)\n", slot_index + 1, sent, sent + n, (float)(sent + n) * 100.0f / (float)slot_samples);
-            int rc_append = ft8_stream_append_float(stream, chunk, n);
-            
-            if (rc_append < 0) {
-                Serial.printf("[ft8] Stream append failed in slot %d at sample %d\n", slot_index + 1, sent);
-                ft8_stream_close(stream);
-                free(chunk);
-                free(signal);
-                return;
-            }
-
-            blocks += rc_append;
-            int sent_before = sent;
-            sent += n;
-            ++chunk_index;
-
-            if (!checkpoint_mark_logged && checkpoint_samples > 0 && sent_before < checkpoint_samples && sent >= checkpoint_samples)
-            {
-                Serial.printf("[ft8] Slot %d crossed checkpoint sample count: %d/%d\n",
-                              slot_index + 1,
-                              sent,
-                              checkpoint_samples);
-                checkpoint_mark_logged = true;
-            }
-
-            next_chunk_deadline_us += (int64_t)n * 1000000LL / (int64_t)sample_rate;
-            sleep_until_mono_us(next_chunk_deadline_us);
-        }
-
-        int rc = ft8_stream_finalize(stream);
-        ft8_stream_close(stream);
-        unsigned long elapsed = millis() - t0;
-
-        Serial.printf("[ft8] Slot %d ingest complete: %d samples in %d-sample chunks, %d full blocks\n",
-                      slot_index + 1, slot_samples, chunk_samples, blocks);
-        Serial.printf("[ft8] Slot %d done in %lu ms, rc=%d, free heap: %lu bytes\n",
-                      slot_index + 1, elapsed, rc, (unsigned long)ESP.getFreeHeap());
-
-        ++slot_index;
+    // Emit callback notifications for final pass only.
+    if (strcmp(phase, "final") != 0) {
+        return;
     }
 
-    free(chunk);
-    free(signal);
+    Serial.printf("[cb] %04d/%02d/%02d %02d:%02d:%02d %3d %+4.2lf %'.1lf ~ %s\n",
+                  utc->tm_year + 1900,
+                  utc->tm_mon + 1,
+                  utc->tm_mday,
+                  utc->tm_hour,
+                  utc->tm_min,
+                  utc->tm_sec,
+                  (int)lroundf(msg->snr_db),
+                  tbase_sec + msg->time_sec,
+                  1.0e6 * base_freq_mhz + msg->freq_hz,
+                  msg->text);
 }
 
-static void decode_task(void* /*arg*/)
+typedef struct {
+    File file;
+    uint16_t num_channels;
+    uint32_t sample_rate;
+    uint32_t data_start;
+    uint32_t data_size;
+    uint32_t num_samples;
+    uint32_t sample_index;
+    bool valid;
+} wav_stream_t;
+
+typedef struct {
+    int16_t* data;
+    int capacity;
+    int read_idx;
+    int write_idx;
+    int count;
+} sample_ring_t;
+
+static bool sample_ring_init(sample_ring_t* ring, int capacity)
+{
+    ring->data = (int16_t*)malloc((size_t)capacity * sizeof(int16_t));
+    if (ring->data == nullptr)
+        return false;
+    ring->capacity = capacity;
+    ring->read_idx = 0;
+    ring->write_idx = 0;
+    ring->count = 0;
+    return true;
+}
+
+static void sample_ring_free(sample_ring_t* ring)
+{
+    if (ring->data != nullptr)
+        free(ring->data);
+    ring->data = nullptr;
+    ring->capacity = 0;
+    ring->read_idx = 0;
+    ring->write_idx = 0;
+    ring->count = 0;
+}
+
+static bool sample_ring_push(sample_ring_t* ring, int16_t sample)
+{
+    if (ring->count >= ring->capacity)
+        return false;
+    ring->data[ring->write_idx] = sample;
+    ring->write_idx = (ring->write_idx + 1) % ring->capacity;
+    ++ring->count;
+    return true;
+}
+
+static bool sample_ring_pop(sample_ring_t* ring, int16_t* out_sample)
+{
+    if (ring->count <= 0)
+        return false;
+    *out_sample = ring->data[ring->read_idx];
+    ring->read_idx = (ring->read_idx + 1) % ring->capacity;
+    --ring->count;
+    return true;
+}
+
+static bool wav_stream_rewind(wav_stream_t* ws)
+{
+    if (!ws->file.seek(ws->data_start))
+        return false;
+    ws->sample_index = 0;
+    return true;
+}
+
+static bool wav_stream_open(const char* path, wav_stream_t* ws)
+{
+    memset(ws, 0, sizeof(*ws));
+    ws->file = LittleFS.open(path, "r");
+    if (!ws->file) {
+        Serial.printf("[ft8] Cannot open %s\n", path);
+        return false;
+    }
+
+    // Read and parse WAV header (RIFF container)
+    uint8_t riff_header[12];
+    if (ws->file.read(riff_header, 12) != 12 || memcmp(riff_header, "RIFF", 4) != 0 || memcmp(riff_header + 8, "WAVE", 4) != 0) {
+        Serial.println("[ft8] Not a valid WAVE file");
+        ws->file.close();
+        return false;
+    }
+
+    // Read chunks until we find "fmt " and "data"
+    uint8_t chunk_header[8];
+    uint32_t chunk_size = 0;
+    uint16_t audio_format = 0;
+    uint16_t bits_per_sample = 0;
+    bool found_fmt = false, found_data = false;
+
+    while (ws->file.read(chunk_header, 8) == 8) {
+        chunk_size = (chunk_header[7] << 24) | (chunk_header[6] << 16) | (chunk_header[5] << 8) | chunk_header[4];
+
+        if (memcmp(chunk_header, "fmt ", 4) == 0) {
+            uint8_t fmt_data[16];
+            if (ws->file.read(fmt_data, 16) != 16) break;
+            audio_format = (fmt_data[1] << 8) | fmt_data[0];
+            ws->num_channels = (fmt_data[3] << 8) | fmt_data[2];
+            ws->sample_rate = (fmt_data[7] << 24) | (fmt_data[6] << 16) | (fmt_data[5] << 8) | fmt_data[4];
+            bits_per_sample = (fmt_data[15] << 8) | fmt_data[14];
+            found_fmt = true;
+            if (chunk_size > 16) ws->file.seek(ws->file.position() + chunk_size - 16);
+        } else if (memcmp(chunk_header, "data", 4) == 0) {
+            ws->data_start = ws->file.position();
+            ws->data_size = chunk_size;
+            found_data = true;
+            break;
+        } else {
+            ws->file.seek(ws->file.position() + chunk_size);
+        }
+    }
+
+    if (!found_fmt || !found_data) {
+        Serial.println("[ft8] Missing fmt or data chunk");
+        ws->file.close();
+        return false;
+    }
+
+    if (audio_format != 1 || bits_per_sample != 16) {
+        Serial.printf("[ft8] Unsupported format: %u-bit, format %u\n", bits_per_sample, audio_format);
+        ws->file.close();
+        return false;
+    }
+
+    if (ws->num_channels == 0) {
+        Serial.println("[ft8] Invalid channel count");
+        ws->file.close();
+        return false;
+    }
+
+    ws->num_samples = ws->data_size / ((uint32_t)ws->num_channels * 2U);
+    ws->sample_index = 0;
+    ws->valid = wav_stream_rewind(ws);
+    if (!ws->valid) {
+        Serial.println("[ft8] Failed to seek WAV data start");
+        ws->file.close();
+        return false;
+    }
+
+    return true;
+}
+
+static void wav_stream_close(wav_stream_t* ws)
+{
+    if (ws->file)
+        ws->file.close();
+    ws->valid = false;
+}
+
+static bool wav_stream_read_sample(wav_stream_t* ws, int16_t* out_sample)
+{
+    if (!ws->valid)
+        return false;
+
+    if (ws->sample_index >= ws->num_samples) {
+        if (!wav_stream_rewind(ws))
+            return false;
+    }
+
+    int16_t raw_sample = 0;
+    if (ws->file.read((uint8_t*)&raw_sample, 2) != 2) {
+        if (!wav_stream_rewind(ws))
+            return false;
+        if (ws->file.read((uint8_t*)&raw_sample, 2) != 2)
+            return false;
+    }
+
+    for (uint16_t ch = 1; ch < ws->num_channels; ++ch) {
+        int16_t discard = 0;
+        if (ws->file.read((uint8_t*)&discard, 2) != 2)
+            return false;
+    }
+
+    ++ws->sample_index;
+    *out_sample = raw_sample;
+    return true;
+}
+
+static bool fill_sample_ring_from_wav(sample_ring_t* ring, wav_stream_t* ws, int target_fill)
+{
+    if (target_fill > ring->capacity)
+        target_fill = ring->capacity;
+
+    while (ring->count < target_fill) {
+        int16_t sample = 0;
+        if (!wav_stream_read_sample(ws, &sample))
+            return false;
+        if (!sample_ring_push(ring, sample))
+            return false;
+    }
+    return true;
+}
+
+static int collect_wav_paths(char paths[kMaxWavFiles][kMaxPathLen])
+{
+    int count = 0;
+    File root = LittleFS.open("/");
+    File entry;
+    while ((entry = root.openNextFile()) && count < kMaxWavFiles) {
+        String name = String("/") + entry.name();
+        entry.close();
+        if (name.endsWith(".wav") || name.endsWith(".WAV")) {
+            snprintf(paths[count], kMaxPathLen, "%s", name.c_str());
+            ++count;
+        }
+    }
+    return count;
+}
+
+static void sample_producer_task(void* /*arg*/)
 {
     if (!LittleFS.begin(true)) {
         Serial.println("[ft8] LittleFS mount failed - reflash filesystem");
         vTaskDelete(nullptr);
         return;
     }
-    
-    Serial.println("[ft8] LittleFS mounted");
-    File root = LittleFS.open("/");
-    File entry;
-    while ((entry = root.openNextFile())) {
-        String name = String("/") + entry.name();
-        entry.close();
-        if (name.endsWith(".wav") || name.endsWith(".WAV")) {
-            decode_file(name.c_str(), 14.074f, true);
-        }
+
+    char wav_paths[kMaxWavFiles][kMaxPathLen] = {{0}};
+    int wav_count = collect_wav_paths(wav_paths);
+    Serial.printf("[ft8] Found %d wav files in LittleFS\n", wav_count);
+    if (wav_count <= 0) {
+        vTaskDelete(nullptr);
+        return;
     }
-    
-    Serial.println("\n[ft8] All files decoded.");
+
+    struct tm slot_start_tm = {0};
+    double slot_start_frac = 0.0;
+    time_t slot_start_epoch = 0;
+    int64_t slot_start_deadline_us = 0;
+
+    for (int idx = 0; idx < wav_count; ++idx) {
+        wav_stream_t wav_local = {};
+        wav_stream_t* wav = &wav_local;
+
+        if (!wav_stream_open(wav_paths[idx], &wav_local)) {
+            continue;
+        }
+
+        const bool is_ft8 = true;
+        const float base_freq_mhz = 14.074f;
+        const int sample_rate = (int)wav->sample_rate;
+        const int slot_samples = (int)(15.0f * sample_rate + 0.5f);
+        const int symbol_samples = (int)(0.160f * sample_rate + 0.5f);
+        const int checkpoint_samples = is_ft8 ? (79 * symbol_samples) : 0;
+
+        // Publish stream format before boundary wait so consumer aligns to the same first slot.
+        if (g_active_sample_rate == 0) {
+            g_active_sample_rate = sample_rate;
+        }
+
+        if (idx == 0) {
+            struct timeval tv_now = {0};
+            gettimeofday(&tv_now, nullptr);
+            double epoch_now = (double)tv_now.tv_sec + (double)tv_now.tv_usec / 1000000.0;
+            long slot_index = (long)(epoch_now / 15.0);
+            double slot_epoch_d = (double)slot_index * 15.0;
+            if (epoch_now - slot_epoch_d > 1e-6) {
+                slot_epoch_d += 15.0;
+            }
+
+            double wait_sec = slot_epoch_d - epoch_now;
+            if (wait_sec > 0.0) {
+                Serial.printf("[ft8] waiting %.3f s for initial slot boundary 00/15/30/45\n", wait_sec);
+                sleep_seconds(wait_sec);
+            }
+
+            slot_start_epoch = (time_t)slot_epoch_d;
+            slot_start_deadline_us = esp_timer_get_time();
+        }
+
+        gmtime_r(&slot_start_epoch, &slot_start_tm);
+        slot_start_frac = 0.0;
+
+        sample_ring_t prefetch = {};
+        int ring_capacity = kProducerPrefetchSamples;
+        if (ring_capacity > slot_samples)
+            ring_capacity = slot_samples;
+
+        if (!sample_ring_init(&prefetch, ring_capacity)) {
+            Serial.println("[ft8] Failed to allocate producer prefetch ring");
+            wav_stream_close(wav);
+            continue;
+        }
+
+        int startup_prefill = kProducerStartupPrefillSamples;
+        if (startup_prefill > prefetch.capacity)
+            startup_prefill = prefetch.capacity;
+        if (!fill_sample_ring_from_wav(&prefetch, wav, startup_prefill)) {
+            Serial.printf("[ft8] Failed to prefill samples for %s\n", wav_paths[idx]);
+            sample_ring_free(&prefetch);
+            wav_stream_close(wav);
+            continue;
+        }
+
+        if (slot_start_deadline_us > 0) {
+            sleep_until_mono_us(slot_start_deadline_us);
+        }
+
+        const int64_t slot_end_deadline_us = slot_start_deadline_us + 15000000LL;
+        int sent_samples = 0;
+        for (int i = 0; i < slot_samples; ++i) {
+            if (esp_timer_get_time() >= slot_end_deadline_us) {
+                Serial.printf("[ft8] %s slot cutoff at boundary: sent %d/%d samples\n", wav_paths[idx], i, slot_samples);
+                break;
+            }
+
+            if (prefetch.count <= (prefetch.capacity / 2)) {
+                if (!fill_sample_ring_from_wav(&prefetch, wav, prefetch.capacity)) {
+                    Serial.printf("[ft8] Failed to refill samples for %s at sample %d\n", wav_paths[idx], i);
+                    break;
+                }
+            }
+
+            int16_t sample = 0;
+            if (!sample_ring_pop(&prefetch, &sample)) {
+                Serial.printf("[ft8] Producer prefetch underrun for %s at sample %d\n", wav_paths[idx], i);
+                break;
+            }
+            xQueueSend(g_sample_queue, &sample, portMAX_DELAY);
+            sent_samples = i + 1;
+
+            if (((i & 63) == 63) || (i + 1 == slot_samples)) {
+                int64_t target_us = slot_start_deadline_us + ((int64_t)(i + 1) * 1000000LL) / (int64_t)sample_rate;
+                if (target_us < slot_end_deadline_us) {
+                    sleep_until_mono_us(target_us);
+                }
+            }
+        }
+
+        if (sent_samples < slot_samples) {
+            Serial.printf("[ft8] %s dropped %d trailing samples to keep slot boundary\n",
+                          wav_paths[idx],
+                          slot_samples - sent_samples);
+        }
+
+        sample_ring_free(&prefetch);
+        wav_stream_close(wav);
+
+        slot_start_epoch += 15;
+        slot_start_deadline_us += 15000000LL;
+        gmtime_r(&slot_start_epoch, &slot_start_tm);
+        slot_start_frac = 0.0;
+    }
+
+    Serial.println("[ft8] Producer completed all wav files");
+    vTaskDelete(nullptr);
+}
+
+static void decoder_consumer_task(void* /*arg*/)
+{
+    while (g_active_sample_rate <= 0) {
+        delay(10);
+    }
+
+    const int sample_rate = g_active_sample_rate;
+    const bool is_ft8 = true;
+    const float base_freq_mhz = 14.074f;
+    const int slot_samples = (int)(15.0f * sample_rate + 0.5f);
+    const int symbol_samples = (int)(0.160f * sample_rate + 0.5f);
+    const int checkpoint_samples = is_ft8 ? (79 * symbol_samples) : 0;
+
+    int slot_index = 0;
+    struct timeval tv_now = {0};
+    gettimeofday(&tv_now, nullptr);
+    double now_epoch0 = (double)tv_now.tv_sec + (double)tv_now.tv_usec / 1000000.0;
+    double next_slot_epoch = floor(now_epoch0 / 15.0) * 15.0;
+    if (now_epoch0 - next_slot_epoch > 1e-6) {
+        next_slot_epoch += 15.0;
+    }
+
+    static constexpr int kAppendBatchSize = 256;
+    int16_t append_batch[kAppendBatchSize];
+
+    for (;;) {
+        gettimeofday(&tv_now, nullptr);
+        double now_epoch = (double)tv_now.tv_sec + (double)tv_now.tv_usec / 1000000.0;
+        while (now_epoch >= (next_slot_epoch + 15.0)) {
+            next_slot_epoch += 15.0;
+        }
+
+        double wait_sec = next_slot_epoch - now_epoch;
+        if (wait_sec > 0.0) {
+            sleep_seconds(wait_sec);
+        }
+
+        gettimeofday(&tv_now, nullptr);
+        now_epoch = (double)tv_now.tv_sec + (double)tv_now.tv_usec / 1000000.0;
+
+        time_t slot_start_sec = (time_t)next_slot_epoch;
+        struct tm utc_start = {0};
+        gmtime_r(&slot_start_sec, &utc_start);
+        double utc_frac_start = next_slot_epoch - (double)slot_start_sec;
+
+        double slot_end_epoch = next_slot_epoch + 15.0;
+        double remain_slot_sec = slot_end_epoch - now_epoch;
+        if (remain_slot_sec < 0.0) {
+            remain_slot_sec = 0.0;
+        }
+        int64_t slot_end_us = esp_timer_get_time() + (int64_t)(remain_slot_sec * 1000000.0 + 0.5);
+
+        Serial.printf("[ft8] Slot start #%d @ %02d:%02d:%02d.%03d (%d Hz)\n",
+                      slot_index + 1,
+                      utc_start.tm_hour,
+                      utc_start.tm_min,
+                      utc_start.tm_sec,
+                      (int)(utc_frac_start * 1000.0 + 0.5),
+                      sample_rate);
+
+        ft8_decode_context_t ctx = {};
+        ctx.is_ft8 = is_ft8;
+        ctx.base_freq_mhz = base_freq_mhz;
+        ctx.utc = utc_start;
+        ctx.utc_frac_sec = utc_frac_start;
+
+        ft8_stream_decoder_t* stream = ft8_stream_open(sample_rate, &ctx);
+        if (stream == nullptr) {
+            Serial.println("[ft8] Failed to open stream decoder");
+            ++slot_index;
+            continue;
+        }
+
+        int ingested_samples = 0;
+        int blocks = 0;
+        bool checkpoint_logged = false;
+        bool ingest_failed = false;
+
+
+        for (;;) {
+            int64_t now_us = esp_timer_get_time();
+            if (now_us >= slot_end_us) {
+                break;
+            }
+
+            int64_t remain_us = slot_end_us - now_us;
+            TickType_t wait_ticks = pdMS_TO_TICKS((remain_us > 5000LL) ? 5 : (remain_us / 1000LL));
+            if (wait_ticks < 1)
+                wait_ticks = 1;
+
+            int16_t first_sample = 0;
+            if (xQueueReceive(g_sample_queue, &first_sample, wait_ticks) != pdTRUE) {
+                continue;
+            }
+
+            int batch_count = 0;
+            append_batch[batch_count++] = first_sample;
+
+            while (batch_count < kAppendBatchSize) {
+                int16_t sample = 0;
+                if (xQueueReceive(g_sample_queue, &sample, 0) != pdTRUE) {
+                    break;
+                }
+                append_batch[batch_count++] = sample;
+            }
+
+            int rc_append = ft8_stream_append_i16(stream, append_batch, batch_count);
+            if (rc_append < 0) {
+                Serial.printf("[ft8] Stream append failed at sample %d\n", ingested_samples + batch_count - 1);
+                ingest_failed = true;
+                break;
+            }
+
+            ingested_samples += batch_count;
+            blocks += rc_append;
+            if (!checkpoint_logged && checkpoint_samples > 0 && ingested_samples >= checkpoint_samples) {
+                Serial.printf("[ft8] Slot #%d reached checkpoint (%d samples / 79 symbols)\n", slot_index + 1, ingested_samples);
+                checkpoint_logged = true;
+            }
+        }
+
+        if (ingest_failed || ingested_samples == 0) {
+            ft8_stream_close(stream);
+        } else {
+            finalize_job_t fin = {};
+            fin.stream = stream;
+            snprintf(fin.path, kMaxPathLen, "slot-%d", slot_index + 1);
+            fin.slot_samples = slot_samples;
+            fin.ingested_samples = ingested_samples;
+            fin.blocks = blocks;
+            xQueueSend(g_finalize_queue, &fin, portMAX_DELAY);
+        }
+
+        next_slot_epoch += 15.0;
+        ++slot_index;
+    }
+}
+
+static void finalize_worker_task(void* /*arg*/)
+{
+    for (;;) {
+        finalize_job_t fin = {};
+        if (xQueueReceive(g_finalize_queue, &fin, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        int rc_final = ft8_stream_finalize(fin.stream);
+        ft8_stream_close(fin.stream);
+
+        Serial.printf("[ft8] Slot done %s: %d samples ingested, %d full blocks, finalize rc=%d\n",
+                      fin.path,
+                      fin.ingested_samples,
+                      fin.blocks,
+                      rc_final);
+    }
+
     vTaskDelete(nullptr);
 }
 
@@ -439,19 +757,51 @@ void setup()
     
     // Initialize NTP for accurate wall-clock time
     init_ntp();
+
+    g_active_sample_rate = 0;
     
-    const uint32_t decode_stack_bytes = 32768;
-    BaseType_t rc = xTaskCreatePinnedToCore(
-        decode_task,
-        "ft8_decode",
-        decode_stack_bytes,
+    g_sample_queue = xQueueCreate(kSampleQueueDepth, sizeof(int16_t));
+    g_finalize_queue = xQueueCreate(4, sizeof(finalize_job_t));
+    if (g_sample_queue == nullptr || g_finalize_queue == nullptr) {
+        Serial.println("[ft8] Failed to create queues");
+        return;
+    }
+
+    BaseType_t rc_consumer = xTaskCreatePinnedToCore(
+        decoder_consumer_task,
+        "ft8_consumer",
+        32768,
+        nullptr,
+        2,
+        nullptr,
+        APP_CPU_NUM
+    );
+
+    BaseType_t rc_producer = xTaskCreatePinnedToCore(
+        sample_producer_task,
+        "ft8_producer",
+        32768,
         nullptr,
         1,
         nullptr,
         APP_CPU_NUM
     );
-    if (rc != pdPASS) {
-        Serial.printf("[ft8] Failed to create decode task (rc=%ld)\n", (long)rc);
+
+    BaseType_t rc_finalize = xTaskCreatePinnedToCore(
+        finalize_worker_task,
+        "ft8_finalize",
+        32768,
+        nullptr,
+        1,
+        nullptr,
+        APP_CPU_NUM
+    );
+
+    if (rc_consumer != pdPASS || rc_producer != pdPASS || rc_finalize != pdPASS) {
+        Serial.printf("[ft8] Failed to create tasks (consumer=%ld producer=%ld finalize=%ld)\n",
+                      (long)rc_consumer,
+                      (long)rc_producer,
+                      (long)rc_finalize);
     }
 }
 
