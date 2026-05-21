@@ -48,7 +48,7 @@
 #endif
 
 #ifndef FT8_SNR_RAW_SCALE
-#define FT8_SNR_RAW_SCALE 0.80f
+#define FT8_SNR_RAW_SCALE 0.57f
 #endif
 
 #ifndef FT8_SNR_SCORE_SCALE
@@ -56,11 +56,11 @@
 #endif
 
 #ifndef FT8_SNR_OFFSET
-#define FT8_SNR_OFFSET -29.00f
+#define FT8_SNR_OFFSET -4.13f
 #endif
 
 #ifndef FT8_SNR_MIN_DB
-#define FT8_SNR_MIN_DB -30.00f
+#define FT8_SNR_MIN_DB -20.00f
 #endif
 
 #ifndef FT8_SNR_MAX_DB

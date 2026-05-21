@@ -588,7 +588,9 @@ struct process_stream
                       &stream->seen_count,
                       stream->seen_capacity,
                       phase_name,
-                      strcmp(phase_name, "final") == 0);
+                      // strcmp(phase_name, "final") == 0
+                      true // Emit decoded messages immediately as they are found during checkpoint and final phases, but not during intermediate checkpoint phase, to avoid overwhelming the callback with duplicates across phases.
+                    );
     clock_gettime(CLOCK_MONOTONIC, &t_dec1);
 
     LOG(LOG_INFO,
@@ -669,7 +671,7 @@ int process_stream_append_float(process_stream_t* stream, const float* signal, i
         ++blocks_processed;
         if (!stream->checkpoint_done && stream->mon.wf.num_blocks >= checkpoint_blocks)
         {
-          LOG(LOG_INFO, "ckpoint reached: %d symbols accumulated\n", stream->mon.wf.num_blocks);
+          LOG(LOG_INFO, "checkpoint reached: %d symbols accumulated\n", stream->mon.wf.num_blocks);
           if (stream_decode_pass(stream, "checkpoint") < 0)
             return -1;
           stream->checkpoint_done = true;
@@ -860,17 +862,17 @@ int process_buffer_ori(float const *signal,int sample_rate, int num_samples, boo
     if(mp == NULL)
       continue; // Shouldn't happen
 
-    OUT("%4d/%02d/%02d %02d:%02d:%02d %3d %+4.2lf %'.1lf ~ %s\n",
-	    tmp->tm_year + 1900,
-	    tmp->tm_mon + 1,
-	    tmp->tm_mday,
-	    tmp->tm_hour,
-	    tmp->tm_min,
-	    tmp->tm_sec,
-      (int)lroundf(mp->snr_db),
-	    tbase + mp->time_sec,
-	    1.0e6 * base_freq + mp->freq_hz,
-      mp->text);
+    // OUT("%4d/%02d/%02d %02d:%02d:%02d %3d %+4.2lf %'.1lf ~ %s\n",
+    //     tmp->tm_year + 1900,
+    //     tmp->tm_mon + 1,
+    //     tmp->tm_mday,
+    //     tmp->tm_hour,
+    //     tmp->tm_min,
+    //     tmp->tm_sec,
+    //     (int)lroundf(mp->snr_db),
+    //     tbase + mp->time_sec,
+    //     1.0e6 * base_freq + mp->freq_hz,
+    //     mp->text);
   }
   free(decoded);
   free(decoded_hashtable);

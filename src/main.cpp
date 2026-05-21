@@ -215,32 +215,32 @@ typedef struct {
     bool valid;
 } wav_stream_t;
 
-extern "C" void ft8_on_message_decoded(const char* phase,
-                                         const struct tm* utc,
-                                         double tbase_sec,
-                                         float base_freq_mhz,
-                                         const message_t* msg)
+extern "C" __attribute__((weak)) void ft8_on_message_decoded(const char* phase,
+                                                               const struct tm* utc,
+                                                               double tbase_sec,
+                                                               float base_freq_mhz,
+                                                               const message_t* msg)
 {
     if (phase == nullptr || utc == nullptr || msg == nullptr) {
         return;
     }
 
     // Emit callback notifications for final pass only.
-    if (strcmp(phase, "final") != 0) {
-        return;
-    }
+    // if (strcmp(phase, "final") != 0) {
+    //     return;
+    // }
 
-    Serial.printf("[cb] %04d/%02d/%02d %02d:%02d:%02d %3d %+4.2lf %'.1lf ~ %s\n",
-                  utc->tm_year + 1900,
-                  utc->tm_mon + 1,
-                  utc->tm_mday,
-                  utc->tm_hour,
-                  utc->tm_min,
-                  utc->tm_sec,
-                  (int)lroundf(msg->snr_db),
-                  tbase_sec + msg->time_sec,
-                  1.0e6 * base_freq_mhz + msg->freq_hz,
-                  msg->text);
+    // Serial.printf("[cb] %04d/%02d/%02d %02d:%02d:%02d %3d %+4.2lf %'.1lf ~ %s\n",
+    //               utc->tm_year + 1900,
+    //               utc->tm_mon + 1,
+    //               utc->tm_mday,
+    //               utc->tm_hour,
+    //               utc->tm_min,
+    //               utc->tm_sec,
+    //               (int)lroundf(msg->snr_db),
+    //               tbase_sec + msg->time_sec,
+    //               1.0e6 * base_freq_mhz + msg->freq_hz,
+    //               msg->text);
 }
 
 typedef struct {
