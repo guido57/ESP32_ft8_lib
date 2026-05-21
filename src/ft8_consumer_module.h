@@ -3,8 +3,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include <freertos/FreeRTOS.h>
-
 #ifdef __cplusplus
 extern "C" {
 #endif

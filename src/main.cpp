@@ -35,7 +35,10 @@
 #include "ft8_decode/decode.h"
 #include "common/debug.h"
 #include "secrets.h"
+
+#if defined(ARDUINO_ARCH_ESP32)
 #include "ft8_consumer_module.h"
+#endif
 
 #if defined(ARDUINO_ARCH_ESP32)
 
