@@ -2,11 +2,12 @@
 // - ESP32 Arduino: scans LittleFS and decodes .wav files
 // - Linux host: decodes a wav path provided as argv[1]
 //
-// Flash the filesystem image first:
-//   pio run --target uploadfs --environment esp32s3
+// For ESP32 Arduino:
+//      Flash the filesystem image first:
+//          pio run --target uploadfs --environment esp32s3
 //
-// Then flash the firmware:
-//   pio run --target upload --environment esp32s3
+//      Then flash the firmware:
+//          pio run --target upload --environment esp32s3
 
 #include <time.h>
 #include <stdint.h>

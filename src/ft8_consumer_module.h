@@ -3,6 +3,15 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#if defined(ARDUINO_ARCH_ESP32)
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#else
+typedef int BaseType_t;
+typedef unsigned int UBaseType_t;
+typedef uint32_t TickType_t;
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
