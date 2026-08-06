@@ -24,27 +24,51 @@
 //   -DFT8_MAX_DECODED_MSGS=200
 
 #ifndef FT8_MIN_SCORE
-#define FT8_MIN_SCORE 10
+#define FT8_MIN_SCORE 8
 #endif
 
 #ifndef FT8_MAX_CANDIDATES
-#define FT8_MAX_CANDIDATES 120
+#define FT8_MAX_CANDIDATES 160
 #endif
 
 #ifndef FT8_LDPC_ITERATIONS
 #define FT8_LDPC_ITERATIONS 20
 #endif
 
+#ifndef FT8_RETRY_ENABLE
+#define FT8_RETRY_ENABLE 1
+#endif
+
+#ifndef FT8_RETRY_LDPC_ITERATIONS
+#define FT8_RETRY_LDPC_ITERATIONS 80
+#endif
+
+#ifndef FT8_RETRY_MIN_SCORE
+#define FT8_RETRY_MIN_SCORE 8
+#endif
+
+#ifndef FT8_CHECKPOINT_DECODE
+#if defined(ARDUINO_ARCH_ESP32)
+#define FT8_CHECKPOINT_DECODE 1
+#else
+#define FT8_CHECKPOINT_DECODE 1
+#endif
+#endif
+
 #ifndef FT8_MAX_DECODED_MSGS
 #define FT8_MAX_DECODED_MSGS 1000
 #endif
 
+#ifndef FT8_SEARCH_MAX_HZ
+#define FT8_SEARCH_MAX_HZ 3000
+#endif
+
 #ifndef FT8_FREQ_OSR
-#define FT8_FREQ_OSR 2
+#define FT8_FREQ_OSR 2        // 2 = Frequency oversampling rate (bin subdivision)
 #endif
 
 #ifndef FT8_TIME_OSR
-#define FT8_TIME_OSR 2
+#define FT8_TIME_OSR 2        // 2 = Time oversampling rate (symbol subdivision)
 #endif
 
 #ifndef FT8_SNR_RAW_SCALE

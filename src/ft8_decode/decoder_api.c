@@ -31,6 +31,7 @@ ft8_stream_decoder_t* ft8_stream_open(int sample_rate, const ft8_decode_context_
     return stream;
 }
 
+// Append samples while receiving audio.
 int ft8_stream_append_i16(ft8_stream_decoder_t* stream, const int16_t* signal, int num_samples)
 {
     if (stream == NULL || signal == NULL || num_samples < 0)

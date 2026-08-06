@@ -81,7 +81,7 @@ extern "C"
     /// @param[out] status decode_status_t structure that will be filled with the status of various decoding steps
     /// @param[out] plain Optional pointer to receive the decoded 174-bit codeword (0/1 bytes)
     /// @return True if the decoding was successful, false otherwise (check status for details)
-    bool ft8lib_decode(const waterfall_t* power, const candidate_t* cand, message_t* message, int max_iterations, decode_status_t* status, uint8_t* plain);
+    bool ft8lib_decode(const waterfall_t* power, int icand, const candidate_t* cand, message_t* message, int max_iterations, decode_status_t* status, uint8_t* plain);
 
 #ifdef __cplusplus
 }

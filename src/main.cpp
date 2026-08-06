@@ -845,12 +845,9 @@ int main(int argc, char** argv)
     ctx.is_ft8 = true;
     ctx.base_freq_mhz = base_freq_mhz;
 
-    const int output_sample_rate = 8000;
+    const int output_sample_rate = sample_rate;
     const int slot_samples = (int)lround(15.0 * (double)output_sample_rate);
     int source_pos = 0;
-    int downsample_phase = 0;
-    float current_sample = 0.0f;
-    bool has_current_sample = false;
     int slot_index = 0;
     bool run_forever = (slots_to_run == 0);
 
@@ -895,30 +892,16 @@ int main(int argc, char** argv)
             int filled = 0;
             while (filled < n)
             {
-                if (!has_current_sample)
-                {
-                    current_sample = signal[source_pos];
-                    ++source_pos;
-                    if (source_pos >= num_samples)
-                        source_pos = 0;
-                    has_current_sample = true;
-                }
+                float scaled = signal[source_pos] * 32767.0f;
+                ++source_pos;
+                if (source_pos >= num_samples)
+                    source_pos = 0;
 
-                for (int dup = 0; dup < 2 && filled < n; ++dup)
-                {
-                    if (downsample_phase == 0)
-                    {
-                        float scaled = current_sample * 32767.0f;
-                        if (scaled > 32767.0f)
-                            scaled = 32767.0f;
-                        if (scaled < -32768.0f)
-                            scaled = -32768.0f;
-                        chunk[filled++] = (int16_t)lroundf(scaled);
-                    }
-                    downsample_phase = (downsample_phase + 1) % 3;
-                }
-
-                has_current_sample = false;
+                if (scaled > 32767.0f)
+                    scaled = 32767.0f;
+                if (scaled < -32768.0f)
+                    scaled = -32768.0f;
+                chunk[filled++] = (int16_t)lroundf(scaled);
             }
 
             int rc_append = ft8_stream_append_i16(stream, chunk, n);

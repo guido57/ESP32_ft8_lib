@@ -66,9 +66,9 @@ static void sleep_seconds(double sec)
 static void decoder_consumer_task(void* /*arg*/)
 {
     const bool is_ft8 = true;
-    const int slot_samples = (int)(15.0f * s_sample_rate + 0.5f);
-    const int symbol_samples = (int)(0.160f * s_sample_rate + 0.5f);
-    const int checkpoint_samples = is_ft8 ? (79 * symbol_samples) : 0;
+    const int slot_samples = (int)(15.0f * s_sample_rate + 0.5f);      // 120005 samples = 15 seconds of samples * 8000 Hz + 5 
+    const int symbol_samples = (int)(0.160f * s_sample_rate + 0.5f);   // 1285 samples = 160 ms of samples * 8000 Hz + 5
+    const int checkpoint_samples = is_ft8 ? (79 * symbol_samples) : 0; // 12.64 seconds of samples for FT8 (79 symbols * 160 ms/symbol) 
 
     int slot_index = 0;
     struct timeval tv_now = {0};
@@ -168,9 +168,9 @@ static void decoder_consumer_task(void* /*arg*/)
 
             // Serial.printf("[ft8] consumer: got %d samples from queue, remain slot time %.3f s\n", 1, (double)(slot_end_us - esp_timer_get_time()) / 1000000.0); 
 
+            // collect a batch of at least s_append_batch_size samples to append to the stream decoder
             int batch_count = 0;
             append_batch[batch_count++] = first_sample;
-
             while (batch_count < s_append_batch_size)
             {
                 int16_t sample = 0;
@@ -179,6 +179,8 @@ static void decoder_consumer_task(void* /*arg*/)
                 append_batch[batch_count++] = sample;
             }
 
+            // append the batch to the stream decoder
+            // append_batch contains batch_count samples to append
             int rc_append = ft8_stream_append_i16(stream, append_batch, batch_count);
             if (rc_append < 0)
             {
@@ -239,10 +241,15 @@ static void finalize_worker_task(void* /*arg*/)
         if (xQueueReceive(s_finalize_queue, &fin, portMAX_DELAY) != pdTRUE)
             continue;
 
+        Serial.printf("[ft8] Finalizing slot-%d: %d samples ingested, %d full blocks\n",
+                      fin.slot_index,
+                      fin.ingested_samples,
+                      fin.blocks);
+
         int rc_final = ft8_stream_finalize(fin.stream);
         ft8_stream_close(fin.stream);
 
-        Serial.printf("[ft8] Slot done slot-%d: %d samples ingested, %d full blocks, finalize rc=%d\n",
+        Serial.printf("[ft8] Slot finalized-%d: %d samples ingested, %d full blocks, finalize rc=%d\n",
                       fin.slot_index,
                       fin.ingested_samples,
                       fin.blocks,

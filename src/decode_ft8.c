@@ -38,7 +38,7 @@ const int kLDPC_iterations = FT8_LDPC_ITERATIONS;
 // Making this bigger seems to only cost memory, which I now allocate from the heap, so what the hell
 const int kMax_decoded_messages = FT8_MAX_DECODED_MSGS;
 
-const int kFreq_osr = FT8_FREQ_OSR; // Frequency oversampling rate (bin subdivision)
+const int kFreq_osr = FT8_FREQ_OSR; // 2 = Frequency oversampling rate (bin subdivision)
 const int kTime_osr = FT8_TIME_OSR; // Time oversampling rate (symbol subdivision)
 static float hann_i(int i, int N)
 {
@@ -158,7 +158,7 @@ void monitor_init(monitor_t* me, const monitor_config_t* cfg)
     // LOG(LOG_DEBUG, "init FFT for %d points work area allocated at %p\n", me->nfft, me->fft_work);
     me->fft_cfg = kiss_fftr_alloc(me->nfft, 0, me->fft_work, &fft_work_size);
 
-    const int max_blocks = (int)(slot_time / symbol_period);
+    const int max_blocks = (int)ceilf(slot_time / symbol_period);
     const int num_bins = (int)(cfg->sample_rate * symbol_period / 2);
     waterfall_init(&me->wf, max_blocks, num_bins, cfg->time_osr, cfg->freq_osr);
     me->wf.protocol = cfg->protocol;
@@ -188,9 +188,9 @@ void monitor_process(monitor_t* me, const float* frame)
     // Check if we can still store more waterfall data
     if (me->wf.num_blocks >= me->wf.max_blocks)
         return;
-  if (me->timedata == NULL || me->freqdata == NULL)
-    return;
-
+    if (me->timedata == NULL || me->freqdata == NULL)
+        return;
+    // calculate the offset in the waterfall magnitude array for the next block of data
     int offset = me->wf.num_blocks * me->wf.block_stride;
     int frame_pos = 0;
 
@@ -208,12 +208,13 @@ void monitor_process(monitor_t* me, const float* frame)
             ++frame_pos;
         }
 
-        // Compute windowed analysis frame
+        // Load nfft time samples into timedata windowing and normalizing
         for (int pos = 0; pos < me->nfft; ++pos)
         {
           me->timedata[pos] = me->fft_norm * me->window[pos] * me->last_frame[pos];
         }
-
+        // calculate FFT of the timedata and store the result in freqdata
+        // printf("monitor_process: calling kiss_fftr for nfft=%d, num_bins=%d\n", me->nfft, me->wf.num_bins);
         kiss_fftr(me->fft_cfg, me->timedata, me->freqdata);
 
         // Loop over two possible frequency bin offsets (for averaging)
@@ -227,7 +228,7 @@ void monitor_process(monitor_t* me, const float* frame)
                 // Scale decibels to unsigned 8-bit range and clamp the value
                 // Range 0-240 covers -120..0 dB in 0.5 dB steps
                 int scaled = (int)(2 * db + 240);
-
+                // Store the scaled magnitude in the waterfall data structure at the appropriate offset 
                 me->wf.mag[offset] = (scaled < 0) ? 0 : ((scaled > 255) ? 255 : scaled);
                 ++offset;
 
@@ -429,6 +430,25 @@ int decode_candidates(const waterfall_t* wf, const candidate_t* candidate_list, 
     int num_decoded = 0;
     message_t **decoded_hashtable = calloc(sizeof(message_t *), max_decoded);
     
+    // try to decode a candidate manually built
+    
+
+    // candidate_t cand;
+    // cand.freq_offset = 205;
+    // cand.freq_sub = 1;
+    // cand.time_offset = 5;
+    // cand.time_sub = 0;
+    // cand.score = 18;
+    // message_t message = {0};
+    // decode_status_t status = {0};
+    // uint8_t plain174[FTX_LDPC_N];
+    // printf("Manual decoding: freq_offset=%d, time_offset=%d, score=%d\n",
+    //        cand.freq_offset, cand.time_offset, cand.score);                    
+    // bool ret = ft8lib_decode(wf, 0, &cand, &message, ldpc_iterations, &status, plain174);
+    // printf("Manual decode: ret=%d, ldpc_errors=%d, crc_calculated=%u, crc_extracted=%u, unpack_status=%d\n",
+    //        ret, status.ldpc_errors, status.crc_calculated, status.crc_extracted, status.unpack_status);
+
+
     for (int idx = 0; idx < num_candidates; ++idx) {
   #if defined(ARDUINO_ARCH_ESP32)
       if ((idx & 0x07) == 0) {
@@ -447,7 +467,34 @@ int decode_candidates(const waterfall_t* wf, const candidate_t* candidate_list, 
         message_t message = {0};
         decode_status_t status = {0};
         uint8_t plain174[FTX_LDPC_N];
-        if (!ft8lib_decode(wf, cand, &message, ldpc_iterations, &status, plain174)) {
+       float cand_freq_hz = (cand->freq_offset + (float)cand->freq_sub / wf->freq_osr) / (is_ft8 ? FT8_SYMBOL_PERIOD : FT4_SYMBOL_PERIOD);
+       float cand_time_sec = (cand->time_offset + (float)cand->time_sub / wf->time_osr) * (is_ft8 ? FT8_SYMBOL_PERIOD : FT4_SYMBOL_PERIOD); 
+      //  printf("Decoding: cand=%d freq_offset_Hz=%f, freq_bin_offset=%d, freq_sub=%d, time_offset_sec=%f, time_offset=%d, time_sub=%d, score=%d\n",
+      //      idx, cand_freq_hz, cand->freq_offset, cand->freq_sub, cand_time_sec, cand->time_offset, cand->time_sub, cand->score);
+        
+        if (!ft8lib_decode(wf, idx, cand, &message, ldpc_iterations, &status, plain174)) {
+          // printf("Decode failed: cand=%d freq_offset_Hz=%f, freq_bin_offset=%d, freq_sub=%d, time_offset=%d, time_sub=%d, score=%d, ldpc_errors=%d, crc_calculated=%u, crc_extracted=%u, unpack_status=%d\n",
+          //        idx, cand_freq_hz, cand->freq_offset, cand->freq_sub, cand->time_offset, cand->time_sub, cand->score,
+          //        status.ldpc_errors, status.crc_calculated, status.crc_extracted, status.unpack_status);
+          bool retried = false;
+    #if FT8_RETRY_ENABLE
+          if (!retried && phase_name != NULL && strcmp(phase_name, "final") == 0 &&
+            cand->score >= FT8_RETRY_MIN_SCORE && FT8_RETRY_LDPC_ITERATIONS > ldpc_iterations)
+          {
+            decode_status_t retry_status = {0};
+            if (ft8lib_decode(wf,idx, cand, &message, FT8_RETRY_LDPC_ITERATIONS, &retry_status, plain174))
+            {
+              status = retry_status;
+              retried = true;
+            }
+          }
+    #endif
+          if (retried)
+          {
+            // Continue below with recovered message.
+          }
+          else
+          {
             if (status.ldpc_errors > 0) {
                 // LOG(LOG_DEBUG, "LDPC decode: %d errors\n", status.ldpc_errors);
             } else if (status.crc_calculated != status.crc_extracted) {
@@ -456,6 +503,7 @@ int decode_candidates(const waterfall_t* wf, const candidate_t* candidate_list, 
                 LOG(LOG_DEBUG, "Error while unpacking!\n");
             }
             continue;
+          }
         }
 
         message.freq_hz = freq_hz;
@@ -471,67 +519,96 @@ int decode_candidates(const waterfall_t* wf, const candidate_t* candidate_list, 
             message.snr_db = snr;
         }
 
-        // LOG(LOG_DEBUG, "Checking hash table with %4.1fs start offset / %4.1fHz offset [score %d]...\n", time_sec, freq_hz, cand->score);
+        // DEDUPLICATE
         int idx_hash = message.hash % max_decoded;
         int probe_start = idx_hash;
         bool found_empty_slot = false;
         bool found_duplicate = false;
+        bool replaced_duplicate = false; // New flag for replacement
         do {
           if (decoded_hashtable[idx_hash] == NULL) {
             found_empty_slot = true;
           } else if ((decoded_hashtable[idx_hash]->hash == message.hash) && (0 == strcmp(decoded_hashtable[idx_hash]->text, message.text))) {
-            found_duplicate = true;
+            // Found a duplicate. Check if the new message is 'better'.
+            // For example, if it has a higher score.
+            if (message.score > decoded_hashtable[idx_hash]->score) {
+              replaced_duplicate = true; // Mark for replacement
+            } else {
+              found_duplicate = true; // Keep existing if new one is not better
+            }
           } else {
             idx_hash = (idx_hash + 1) % max_decoded;
             if (idx_hash == probe_start) {
               LOG(LOG_DEBUG, "Decoded-message table full, dropping [%s]\n", message.text);
-              found_duplicate = true;
+              found_duplicate = true; // Treat as a duplicate if table is full and no slot found
             }
           }
-        } while (!found_empty_slot && !found_duplicate);
+        } while (!found_empty_slot && !found_duplicate && !replaced_duplicate);
 
-        if (found_empty_slot) {
-            decoded[idx_hash] = message;
-            decoded_hashtable[idx_hash] = &decoded[idx_hash];
-            ++num_decoded;
+        if(found_empty_slot) {
+          // Output the decoded message with timestamp, SNR, frequency, and text
+          // OUT("%4d/%02d/%02d %02d:%02d:%02d %d %'.1lf ~ %s\n",
+          //   tmp->tm_year + 1900, tmp->tm_mon + 1, tmp->tm_mday,
+          //   tmp->tm_hour, tmp->tm_min, tmp->tm_sec,
+          //   (int)lroundf(message.snr_db),
+          //   // tbase + message.time_sec,
+          //   1.0e6 * base_freq + message.freq_hz,
+          //   message.text);
+          printf("Decoded: %4d/%02d/%02d %02d:%02d:%02d SNR=%d dB, Freq=%.1lf Hz, DT=%.1lf Text=[%s]\n",
+                tmp->tm_year + 1900, tmp->tm_mon + 1, tmp->tm_mday,
+                tmp->tm_hour, tmp->tm_min, tmp->tm_sec,
+                (int)lroundf(message.snr_db),
+                message.freq_hz,
+                message.time_sec,
+                message.text);
+
+
         }
-    }
-    
+
+        if (found_empty_slot || replaced_duplicate) {
+            decoded[idx_hash] = message; // Insert or replace
+            decoded_hashtable[idx_hash] = &decoded[idx_hash];
+            if (!replaced_duplicate) { // Only increment count if it's a truly new message
+                ++num_decoded;
+            }
+        }
+    }    
     // Sort messages by frequency and push empty entries to end
-    qsort(decoded_hashtable, max_decoded, sizeof(message_t *), mcompare);
+    // qsort(decoded_hashtable, max_decoded, sizeof(message_t *), mcompare);
     
     // Output messages
-    double tbase = tmp->tm_sec;
-    tbase = is_ft8 ? fmod(tbase, 15.0) : fmod(tbase, 7.5);
-    tbase += sec;
-    for(int i = 0; i < num_decoded; i++){
-        message_t const *mp = decoded_hashtable[i];
-        if(mp == NULL)
-            continue;
+    // double tbase = tmp->tm_sec;
+    // tbase = is_ft8 ? fmod(tbase, 15.0) : fmod(tbase, 7.5);
+    // tbase += sec;
+    // for(int i = 0; i < num_decoded; i++){
+    //     message_t const *mp = decoded_hashtable[i];
+    //     if(mp == NULL)
+    //         continue;
 
-      if (seen_messages != NULL && seen_count != NULL && seen_capacity > 0)
-      {
-        if (emitted_messages_contains(seen_messages, *seen_count, mp))
-        {
-          // LOG(LOG_DEBUG, "Suppressing duplicate message across stream phases [%s]\n", mp->text);
-          continue;
-        }
-        emitted_messages_add(seen_messages, seen_count, seen_capacity, mp);
-      }
+    //   if (seen_messages != NULL && seen_count != NULL && seen_capacity > 0)
+    //   {
+    //     if (emitted_messages_contains(seen_messages, *seen_count, mp))
+    //     {
+    //       // LOG(LOG_DEBUG, "Suppressing duplicate message across stream phases [%s]\n", mp->text);
+    //       continue;
+    //     }
+    //     // Add to seen_messages for future duplicate suppression
+    //     emitted_messages_add(seen_messages, seen_count, seen_capacity, mp);
+    //   }
 
-      OUT("%4d/%02d/%02d %02d:%02d:%02d %3d %+4.2lf %'.1lf ~ %s\n",
-            tmp->tm_year + 1900, tmp->tm_mon + 1, tmp->tm_mday,
-            tmp->tm_hour, tmp->tm_min, tmp->tm_sec,
-            (int)lroundf(mp->snr_db),
-            tbase + mp->time_sec,
-            1.0e6 * base_freq + mp->freq_hz,
-            mp->text);
+      // OUT("%4d/%02d/%02d %02d:%02d:%02d %3d %+4.2lf %'.1lf ~ %s\n",
+      //       tmp->tm_year + 1900, tmp->tm_mon + 1, tmp->tm_mday,
+      //       tmp->tm_hour, tmp->tm_min, tmp->tm_sec,
+      //       (int)lroundf(mp->snr_db),
+      //       tbase + mp->time_sec,
+      //       1.0e6 * base_freq + mp->freq_hz,
+      //       mp->text);
 
-      if (emit_callback)
-      {
-        ft8_on_message_decoded(phase_name, tmp, tbase, base_freq, mp);
-      }
+    if (emit_callback)
+    {
+        // ft8_on_message_decoded(phase_name, tmp, tbase, base_freq, mp);
     }
+    
     free(decoded_hashtable);
     return num_decoded;
 }
@@ -566,12 +643,25 @@ struct process_stream
     candidate_t candidate_list[candidate_size];
 
     clock_gettime(CLOCK_MONOTONIC, &t_cand0);
+    printf("stream_decode_pass: searching for candidates...\n");
+    printf("waterfall is ready: num_blocks=%d, max_blocks=%d, block_stride=%d, num_bins=%d, time_osr=%d, freq_osr=%d\n",
+           stream->mon.wf.num_blocks, stream->mon.wf.max_blocks, stream->mon.wf.block_stride, stream->mon.wf.num_bins,
+           stream->mon.wf.time_osr, stream->mon.wf.freq_osr);
+    
     int num_candidates = find_candidates(&stream->mon.wf, candidate_list, candidate_size, kMin_score);
     clock_gettime(CLOCK_MONOTONIC, &t_cand1);
 
     message_t* decoded = calloc((size_t)kMax_decoded_messages, sizeof(*decoded));
     if (decoded == NULL)
       return -1;
+
+    // printf("stream_decode_pass: %d candidates found, decoding...\n", num_candidates);
+    // for(int i = 0; i < num_candidates; ++i) {
+    //     float freq_hz = (candidate_list[i].freq_offset + (float)candidate_list[i].freq_sub / stream->mon.wf.freq_osr) / (stream->is_ft8 ? FT8_SYMBOL_PERIOD : FT4_SYMBOL_PERIOD);
+    //     float time_sec = (candidate_list[i].time_offset + (float)candidate_list[i].time_sub / stream->mon.wf.time_osr) * (stream->is_ft8 ? FT8_SYMBOL_PERIOD : FT4_SYMBOL_PERIOD);
+    //     printf("Candidate %d; freq_bin_offset=%d, freq_offset=%f; time_offset=%f; score=%d\n",
+    //            i, candidate_list[i].freq_offset, freq_hz, time_sec, candidate_list[i].score);
+    // }
 
     int num_decoded = decode_candidates(&stream->mon.wf,
                       candidate_list,
@@ -616,10 +706,13 @@ process_stream_t* process_stream_open(int sample_rate, bool is_ft8, float base_f
       return NULL;
 
     stream->mon_cfg.f_min = 100;
-    stream->mon_cfg.f_max = sample_rate / 2 - 500;
-    stream->mon_cfg.sample_rate = sample_rate;
-    stream->mon_cfg.time_osr = kTime_osr;
-    stream->mon_cfg.freq_osr = kFreq_osr;
+    float search_f_max = (float)(sample_rate / 2 - 500);
+    if (FT8_SEARCH_MAX_HZ > 0 && search_f_max > (float)FT8_SEARCH_MAX_HZ)
+      search_f_max = (float)FT8_SEARCH_MAX_HZ;
+    stream->mon_cfg.f_max = search_f_max;
+    stream->mon_cfg.sample_rate = sample_rate;  // 8000 Hz
+    stream->mon_cfg.time_osr = kTime_osr;       // 2 = Time oversampling rate (symbol subdivision)
+    stream->mon_cfg.freq_osr = kFreq_osr;       // 2 = Frequency oversampling rate (bin subdivision)
     stream->mon_cfg.protocol = is_ft8 ? PROTO_FT8 : PROTO_FT4;
 
     stream->is_ft8 = is_ft8;
@@ -672,8 +765,10 @@ int process_stream_append_float(process_stream_t* stream, const float* signal, i
         if (!stream->checkpoint_done && stream->mon.wf.num_blocks >= checkpoint_blocks)
         {
           LOG(LOG_INFO, "checkpoint reached: %d symbols accumulated\n", stream->mon.wf.num_blocks);
+#if FT8_CHECKPOINT_DECODE
           if (stream_decode_pass(stream, "checkpoint") < 0)
             return -1;
+#endif
           stream->checkpoint_done = true;
         }
         continue;
@@ -693,8 +788,10 @@ int process_stream_append_float(process_stream_t* stream, const float* signal, i
         if (!stream->checkpoint_done && stream->mon.wf.num_blocks >= checkpoint_blocks)
         {
           LOG(LOG_INFO, "Streaming checkpoint reached: %d symbols accumulated %d samples\n", stream->mon.wf.num_blocks, stream->mon.wf.num_blocks * stream->mon.block_size);
+#if FT8_CHECKPOINT_DECODE
           if (stream_decode_pass(stream, "checkpoint") < 0)
             return -1;
+#endif
           stream->checkpoint_done = true;
         }
       }
@@ -707,14 +804,22 @@ int process_stream_finalize(process_stream_t* stream)
 {
     if (stream == NULL)
       return -1;
-    if (stream->finalized)
+    if (stream->finalized) 
+      // Already finalized, nothing to do
       return 0;
 
     stream->finalized = true;
 
     if (stream->carry_samples > 0)
+    // Pad the remaining samples with zeros to complete the final block
     {
-      LOG(LOG_INFO, "Streaming finalize: dropping %d tail samples (< %d block size)\n", stream->carry_samples, stream->mon.block_size);
+      int n_pad = stream->mon.block_size - stream->carry_samples;
+      memset(stream->carry + stream->carry_samples, 0, (size_t)n_pad * sizeof(stream->carry[0]));
+      monitor_process(&stream->mon, stream->carry);
+      LOG(LOG_INFO, "Streaming finalize: padded %d tail samples with %d zeros to complete final block\n",
+          stream->carry_samples,
+          n_pad);
+      stream->carry_samples = 0;
     }
 
     return stream_decode_pass(stream, "final");
@@ -750,7 +855,7 @@ int process_buffer_ori(float const *signal,int sample_rate, int num_samples, boo
   monitor_t mon = {0};
   monitor_config_t const mon_cfg = {
     .f_min = 100,
-    .f_max = sample_rate/2 - 500, // allow room for the receiver filter rolloff
+    .f_max = ((FT8_SEARCH_MAX_HZ > 0) && ((sample_rate/2 - 500) > FT8_SEARCH_MAX_HZ)) ? (float)FT8_SEARCH_MAX_HZ : (float)(sample_rate/2 - 500),
     .sample_rate = sample_rate,
     .time_osr = kTime_osr,
     .freq_osr = kFreq_osr,
@@ -794,7 +899,7 @@ int process_buffer_ori(float const *signal,int sample_rate, int num_samples, boo
       message_t message = {0}; // Written by ft8lib_decode()
       decode_status_t status = {0}; // ditto
       uint8_t plain174[FTX_LDPC_N];
-      if (!ft8lib_decode(&mon.wf, cand, &message, kLDPC_iterations, &status, plain174)){
+      if (!ft8lib_decode(&mon.wf, idx, cand, &message, kLDPC_iterations, &status, plain174)){
 	      // printf("000000 %3d %+4.2f %4.0f ~  ---\n", cand->score, time_sec, freq_hz);
         if (status.ldpc_errors > 0){
           LOG(LOG_DEBUG, "LDPC decode: %d errors\n", status.ldpc_errors);

@@ -17,6 +17,39 @@
 #include <stdlib.h>
 #include <stdbool.h>
 
+#if defined(ARDUINO_ARCH_ESP32)
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <esp_task_wdt.h>
+#endif
+
+#if defined(ARDUINO_ARCH_ESP32)
+static inline void ldpc_cooperate(void)
+{
+    // Keep CPU watchdog happy during long per-candidate LDPC iteration loops
+    // while avoiding excessive decode slowdown.
+    static unsigned s_coop_counter = 0;
+    ++s_coop_counter;
+    if ((s_coop_counter & 0x3F) == 0)
+    {
+        esp_task_wdt_reset();
+    }
+    if ((s_coop_counter & 0x3FF) == 0)
+    {
+        // Rare full tick delay to guarantee lower-priority tasks (IDLE) run.
+        vTaskDelay(1);
+    }
+    else
+    {
+        taskYIELD();
+    }
+}
+#else
+static inline void ldpc_cooperate(void)
+{
+}
+#endif
+
 static int ldpc_check(uint8_t codeword[]);
 static float fast_tanh(float x);
 static float fast_atanh(float x);
@@ -42,8 +75,17 @@ void ft8lib_ldpc_decode(float codeword[], int max_iters, uint8_t plain[], int* o
 
     for (int iter = 0; iter < max_iters; iter++)
     {
+        if ((iter & 0x03) == 0)
+        {
+            ldpc_cooperate();
+        }
+
         for (int j = 0; j < FTX_LDPC_M; j++)
         {
+            if ((j & 0x0f) == 0)
+            {
+                ldpc_cooperate();
+            }
             for (int ii1 = 0; ii1 < kFTX_LDPC_Num_rows[j]; ii1++)
             {
                 int i1 = kFTX_LDPC_Nm[j][ii1] - 1;
@@ -62,6 +104,10 @@ void ft8lib_ldpc_decode(float codeword[], int max_iters, uint8_t plain[], int* o
 
         for (int i = 0; i < FTX_LDPC_N; i++)
         {
+            if ((i & 0x1f) == 0)
+            {
+                ldpc_cooperate();
+            }
             float l = codeword[i];
             for (int j = 0; j < 3; j++)
                 l += e[kFTX_LDPC_Mn[i][j] - 1][i];
@@ -83,6 +129,10 @@ void ft8lib_ldpc_decode(float codeword[], int max_iters, uint8_t plain[], int* o
 
         for (int i = 0; i < FTX_LDPC_N; i++)
         {
+            if ((i & 0x1f) == 0)
+            {
+                ldpc_cooperate();
+            }
             for (int ji1 = 0; ji1 < 3; ji1++)
             {
                 int j1 = kFTX_LDPC_Mn[i][ji1] - 1;
@@ -142,6 +192,11 @@ void ft8lib_bp_decode(float codeword[], int max_iters, uint8_t plain[], int* ok)
 
     for (int iter = 0; iter < max_iters; ++iter)
     {
+        if ((iter & 0x03) == 0)
+        {
+            ldpc_cooperate();
+        }
+
         // Do a hard decision guess (tov=0 in iter 0)
         int plain_sum = 0;
         for (int n = 0; n < FTX_LDPC_N; ++n)
@@ -173,6 +228,10 @@ void ft8lib_bp_decode(float codeword[], int max_iters, uint8_t plain[], int* ok)
         // Send messages from bits to check nodes
         for (int m = 0; m < FTX_LDPC_M; ++m)
         {
+            if ((m & 0x0f) == 0)
+            {
+                ldpc_cooperate();
+            }
             for (int n_idx = 0; n_idx < kFTX_LDPC_Num_rows[m]; ++n_idx)
             {
                 int n = kFTX_LDPC_Nm[m][n_idx] - 1;
@@ -192,6 +251,10 @@ void ft8lib_bp_decode(float codeword[], int max_iters, uint8_t plain[], int* ok)
         // send messages from check nodes to variable nodes
         for (int n = 0; n < FTX_LDPC_N; ++n)
         {
+            if ((n & 0x1f) == 0)
+            {
+                ldpc_cooperate();
+            }
             for (int m_idx = 0; m_idx < 3; ++m_idx)
             {
                 int m = kFTX_LDPC_Mn[n][m_idx] - 1;

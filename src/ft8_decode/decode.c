@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <math.h>
 #include <stddef.h>
+#include <stdio.h>
 
 /// Compute log likelihood log(p(1) / p(0)) of 174 message bits for later use in soft-decision LDPC decoding
 /// @param[in] wf Waterfall data collected during message slot
@@ -42,6 +43,7 @@ static int get_index(const waterfall_t* wf, const candidate_t* candidate)
     return offset;
 }
 
+// Compute a score for a candidate based on the Costas sync symbols
 static int ft8_sync_score(const waterfall_t* wf, const candidate_t* candidate)
 {
     int score = 0;
@@ -50,7 +52,7 @@ static int ft8_sync_score(const waterfall_t* wf, const candidate_t* candidate)
     // Get the pointer to symbol 0 of the candidate
     const uint8_t* mag_cand = wf->mag + get_index(wf, candidate);
 
-    // Compute average score over sync symbols (m+k = 0-7, 36-43, 72-79)
+    // Compute average score over Costas sync symbols (m+k = 0-7, 36-43, 72-79)
     for (int m = 0; m < FT8_NUM_SYNC; ++m)
     {
         for (int k = 0; k < FT8_LENGTH_SYNC; ++k)
@@ -179,12 +181,19 @@ int ft8lib_find_sync(const waterfall_t* wf, int num_candidates, candidate_t heap
     // Here we allow time offsets that exceed signal boundaries, as long as we still have all data bits.
     // I.e. we can afford to skip the first 7 or the last 7 Costas symbols, as long as we track how many
     // sync symbols we included in the score, so the score is averaged.
+
+    // Loop over all time and frequency subdivisions, and all time offsets
+
+    // time_sub is 0 or 1. Steps of 160 msecs, so time_sub is 0 or 1 for 80 msec steps
     for (candidate.time_sub = 0; candidate.time_sub < wf->time_osr; ++candidate.time_sub)
     {
+        // freq_sub is 0 or 1. steps of 6.25 Hz, so freq_sub is 0 or 1 for 3.125 Hz steps 
         for (candidate.freq_sub = 0; candidate.freq_sub < wf->freq_osr; ++candidate.freq_sub)
         {
+            // time offset is -12 to 23. Steps of 160 msecs, so time_offset is -1.92 secs to 3,68 secs
             for (candidate.time_offset = -12; candidate.time_offset < 24; ++candidate.time_offset)
             {
+                // freq_offset is 0 to 952=960-8. steps of 6.25 Hz
                 for (candidate.freq_offset = 0; (candidate.freq_offset + 7) < wf->num_bins; ++candidate.freq_offset)
                 {
                     if (wf->protocol == PROTO_FT4)
@@ -314,7 +323,7 @@ static void ftx_normalize_logl(float* log174)
     }
 }
 
-bool ft8lib_decode(const waterfall_t* wf, const candidate_t* cand, message_t* message, int max_iterations, decode_status_t* status, uint8_t* plain)
+bool ft8lib_decode(const waterfall_t* wf, int icand, const candidate_t* cand, message_t* message, int max_iterations, decode_status_t* status, uint8_t* plain)
 {
     float log174[FTX_LDPC_N]; // message bits encoded as likelihood
     if (wf->protocol == PROTO_FT4)
@@ -327,6 +336,12 @@ bool ft8lib_decode(const waterfall_t* wf, const candidate_t* cand, message_t* me
     }
 
     ftx_normalize_logl(log174);
+    // printf("After ftx_normalize_logl: candidate %d: freq_offset_Hz=%f, freq_bin_offset=%d, freq_sub=%d, time_offset=%d, time_sub=%d, score=%d\n",
+    //        icand, (cand->freq_offset * 6.25f), cand->freq_offset, cand->freq_sub, cand->time_offset, cand->time_sub, cand->score);
+    // for(int i=0; i<10; ++i){
+    //     printf("log174[%d] = %10.3f ", i, log174[i]);
+    // }
+    // printf("\n");
 
     uint8_t plain174[FTX_LDPC_N]; // message bits (0/1)
     ft8lib_bp_decode(log174, max_iterations, plain174, &status->ldpc_errors);
@@ -334,6 +349,11 @@ bool ft8lib_decode(const waterfall_t* wf, const candidate_t* cand, message_t* me
 
     if (status->ldpc_errors > 0)
     {
+        if(icand==64||icand==17||icand==41||icand==42||icand==67||icand==37||icand==53||icand==65||icand==96||icand==87||icand==99){
+            printf("Candidate %d: LDPC decode failed with %d errors. Freq=%.1f Hz DT=%.1f\n", 
+                icand, status->ldpc_errors, (cand->freq_offset + cand->freq_sub / (float)wf->freq_osr) * 6.25f, (cand->time_offset + (float)cand->time_sub / 2) * 0.16);
+        } 
+
         return false;
     }
 
@@ -350,6 +370,9 @@ bool ft8lib_decode(const waterfall_t* wf, const candidate_t* cand, message_t* me
 
     if (status->crc_extracted != status->crc_calculated)
     {
+        
+
+
         return false;
     }
 
