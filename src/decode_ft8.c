@@ -11,6 +11,7 @@
 #include <libgen.h>
 #include <assert.h>
 #include <time.h>
+#include <esp_heap_caps.h>
 
 #include "ft8/decode.h"
 #include "ft8/constants.h"
@@ -20,6 +21,8 @@
 #include "common/debug.h"
 #include "fft/kiss_fftr.h"
 #include "fft/kiss_fft.h"
+
+#include "fft/esp-dsp.h"
 
 #ifndef LOG_LEVEL
 #define LOG_LEVEL LOG_DEBUG
@@ -61,6 +64,13 @@ static float blackman_i(int i, int N)
     float x2 = 2 * x1 * x1 - 1; // Use double angle formula
 
     return a0 - a1 * x1 + a2 * x2;
+}
+
+static double elapsed_ms(const struct timespec *t0, const struct timespec *t1)
+{
+  long sec = t1->tv_sec - t0->tv_sec;
+  long nsec = t1->tv_nsec - t0->tv_nsec;
+  return (double)sec * 1000.0 + (double)nsec / 1000000.0;
 }
 
 void waterfall_init(waterfall_t* me, int max_blocks, int num_bins, int time_osr, int freq_osr)
@@ -117,7 +127,167 @@ typedef struct
 // It calculates DSP parameters, allocates memory for FFT processing and windowing, 
 // sets up a waterfall display, and logs key initialization details, 
 //preparing the monitor for signal processing tasks.
+
+#if defined ARDUINO_ARCH_ESP32
+#include "esp_heap_caps.h"
+#endif
+
+#include "esp_heap_caps.h"
+
 void monitor_init(monitor_t* me, const monitor_config_t* cfg)
+{
+    float slot_time =
+        (cfg->protocol == PROTO_FT4) ? FT4_SLOT_TIME : FT8_SLOT_TIME;
+
+    float symbol_period =
+        (cfg->protocol == PROTO_FT4) ? FT4_SYMBOL_PERIOD : FT8_SYMBOL_PERIOD;
+
+    me->symbol_period = symbol_period;
+
+    // Samples in one FT8/FT4 symbol
+    me->block_size = (int)lroundf(cfg->sample_rate * symbol_period);
+
+    // Time oversampling:
+    // 1 -> 2048 samples
+    // 2 -> 1024 samples
+    // 4 ->  512 samples
+    // 8 ->  256 samples
+    me->subblock_size = me->block_size / cfg->time_osr;
+
+    // Frequency oversampling:
+    // 1 -> 2048-point FFT
+    // 2 -> 4096-point FFT
+    me->nfft = me->block_size * cfg->freq_osr;
+
+    me->fft_norm = 2.0f / me->nfft;
+
+    LOG(LOG_INFO,
+        "Monitor: sample_rate=%d time_osr=%d freq_osr=%d\n",
+        cfg->sample_rate,
+        cfg->time_osr,
+        cfg->freq_osr);
+
+    LOG(LOG_INFO,
+        "Block size = %d samples (%.3f ms)\n",
+        me->block_size,
+        1000.0f * symbol_period);
+
+    LOG(LOG_INFO,
+        "Subblock size = %d samples (%.3f ms)\n",
+        me->subblock_size,
+        1000.0f * symbol_period / cfg->time_osr);
+
+    LOG(LOG_INFO,
+        "N_FFT = %d samples (%.3f ms)\n",
+        me->nfft,
+        1000.0f * me->nfft / cfg->sample_rate);
+
+    /*
+     * FFT working buffers in internal DRAM.
+     */
+    me->window =
+        (float *)heap_caps_malloc(
+            me->nfft * sizeof(float),
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+
+    me->last_frame =
+        (float *)heap_caps_malloc(
+            me->nfft * sizeof(float),
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+
+    me->timedata =
+        (kiss_fft_scalar *)heap_caps_malloc(
+            me->nfft * sizeof(kiss_fft_scalar),
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+
+    me->freqdata =
+        (kiss_fft_cpx *)heap_caps_malloc(
+            (me->nfft / 2 + 1) * sizeof(kiss_fft_cpx),
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+
+        
+    if (!me->window || !me->last_frame ||
+        !me->timedata || !me->freqdata)
+    {
+        LOG(LOG_ERROR, "monitor_init: FFT buffer allocation failed\n");
+        return;
+    }
+
+    /*
+     * Start with an empty analysis frame.
+     *
+     * This is important for freq_osr=2 because the first FFT
+     * requires 4096 samples while the input block contains only
+     * 2048 samples.
+     */
+    memset(me->last_frame, 0,
+           me->nfft * sizeof(float));
+
+    for (int i = 0; i < me->nfft; ++i)
+        me->window[i] = hann_i(i, me->nfft);
+
+    /*
+     * KISS FFT work area.
+     */
+    size_t fft_work_size = 0;
+
+    kiss_fftr_alloc(
+        me->nfft,
+        0,
+        NULL,
+        &fft_work_size);
+
+    LOG(LOG_DEBUG,
+        "FFT work area = %zu bytes\n",
+        fft_work_size);
+
+    me->fft_work =
+        heap_caps_malloc(
+            fft_work_size,
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+
+    if (!me->fft_work)
+    {
+        LOG(LOG_ERROR,
+            "monitor_init: FFT work allocation failed\n");
+        return;
+    }
+
+    me->fft_cfg =
+        kiss_fftr_alloc(
+            me->nfft,
+            0,
+            me->fft_work,
+            &fft_work_size);
+
+#if defined ARDUINO_ARCH_ESP32
+    esp_dsp_fftr_init();
+#endif
+
+    /*
+     * One waterfall block corresponds to one FT8 symbol period.
+     * Each block contains time_osr FFTs.
+     */
+    const int max_blocks =
+        (int)(slot_time / symbol_period);
+
+    const int num_bins =
+        (int)(cfg->sample_rate * symbol_period / 2);
+
+    waterfall_init(
+        &me->wf,
+        max_blocks,
+        num_bins,
+        cfg->time_osr,
+        cfg->freq_osr);
+
+    me->wf.protocol = cfg->protocol;
+
+    me->max_mag = -120.0f;
+
+}
+
+void monitor_init_ori(monitor_t* me, const monitor_config_t* cfg)
 {
     float slot_time = (cfg->protocol == PROTO_FT4) ? FT4_SLOT_TIME : FT8_SLOT_TIME;
     float symbol_period = (cfg->protocol == PROTO_FT4) ? FT4_SYMBOL_PERIOD : FT8_SYMBOL_PERIOD;
@@ -153,6 +323,10 @@ void monitor_init(monitor_t* me, const monitor_config_t* cfg)
     LOG(LOG_DEBUG, "init FFT for %d points work area allocated at %p\n", me->nfft, me->fft_work);
     me->fft_cfg = kiss_fftr_alloc(me->nfft, 0, me->fft_work, &fft_work_size);
 
+    #if defined ARDUINO_ARCH_ESP32
+    dsps_fft2r_init_fc32(NULL, 2048); // Configura per 2048 punti
+    #endif
+
     const int max_blocks = (int)(slot_time / symbol_period);
     const int num_bins = (int)(cfg->sample_rate * symbol_period / 2);
     waterfall_init(&me->wf, max_blocks, num_bins, cfg->time_osr, cfg->freq_osr);
@@ -165,75 +339,260 @@ void monitor_init(monitor_t* me, const monitor_config_t* cfg)
 void monitor_free(monitor_t* me)
 {
     waterfall_free(&me->wf);
-    free(me->fft_work);
-  free(me->freqdata);
-  free(me->timedata);
-    free(me->last_frame);
-    free(me->window);
+
+    heap_caps_free(me->fft_work);
+
+    heap_caps_free(me->freqdata);
+
+    heap_caps_free(me->timedata);
+
+    heap_caps_free(me->last_frame);
+
+    heap_caps_free(me->window);
 }
 
-// Compute FFT magnitudes (log wf) for a frame in the signal and update waterfall data
-// Processes a frame of signal data by performing FFT-based analysis, 
-// computing magnitudes in decibels, and updating the waterfall data structure with scaled values. 
-// It handles time and frequency oversampling, applies a window function, 
-// and ensures the results are clamped to an 8-bit range while tracking 
-// the maximum magnitude observed.
+// Funzione helper veloce per approssimare (2 * 10 * log10f(x) + 240) usando i cicli di clock hardware.
+// Evita del tutto la pesantissima funzione log10f() software.
+static inline int fast_db_scale(float mag2) 
+{
+    // Convertiamo il float in un intero interpretando i bit (Type Punning)
+    // Questo ci permette di estrarre l'esponente binario direttamente in 1-2 cicli di clock
+    union { float f; uint32_t i; } u;
+    u.f = mag2;
+    
+    // Se il valore è infinitesimo o zero, restituiamo il minimo del range clampato (0 dB o -120dB scaled)
+    if (u.i < 0x31800000) return 0; // Sotto ~1E-9
+
+    // Estraiamo l'esponente del float (bit 23-30)
+    int exponent = (int)((u.i >> 23) & 0xFF) - 127;
+    
+    // Estraiamo la mantissa come frazione lineare
+    float mantissa = (float)(u.i & 0x7FFFFF) / 8388608.0f;
+
+    // log2(x) = esponente + mantissa (approssimazione lineare ottima per i dB)
+    float log2_approx = (float)exponent + mantissa;
+
+    // Convertiamo da log2 a log10 per la formula dei dB:
+    // db = 10 * log10(x) = 10 * log2(x) * log10(2) = 10 * log2(x) * 0.30103f = 3.0103f * log2(x)
+    // La formula originale fa: scaled = (int)(2 * db + 240) = (int)(2 * 3.0103f * log2_approx + 240)
+    int scaled = (int)(6.0206f * log2_approx + 240.0f);
+    
+    return scaled;
+}
+#include <string.h> // Necessario per memmove
+
+#include <string.h>
+#include <math.h>
+
+static inline float fast_log2f(float x)
+{
+    union {
+        float f;
+        uint32_t i;
+    } v = { x };
+
+    int e = (int)(v.i >> 23) - 127;
+
+    v.i = (v.i & 0x7FFFFF) | 0x3F800000;
+
+    float m = v.f - 1.0f;
+
+    return (float)e +
+           0.00903028f +
+           m * (1.3211363f - 0.33688046f * m);
+}
+
 void monitor_process(monitor_t* me, const float* frame)
 {
-    // Check if we can still store more waterfall data
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
     if (me->wf.num_blocks >= me->wf.max_blocks)
         return;
-  if (me->timedata == NULL || me->freqdata == NULL)
-    return;
 
-    int offset = me->wf.num_blocks * me->wf.block_stride;
+    if (me->timedata == NULL ||
+        me->freqdata == NULL ||
+        me->last_frame == NULL)
+        return;
+
+    const int nfft         = me->nfft;
+    const int block_size   = me->block_size;
+    const int subblock     = me->subblock_size;
+    const int time_osr     = me->wf.time_osr;
+    const int freq_osr     = me->wf.freq_osr;
+    const int num_bins     = me->wf.num_bins;
+    const float fft_norm   = me->fft_norm;
+
+    /*
+     * One monitor_process() call receives exactly one symbol
+     * worth of new samples.
+     */
     int frame_pos = 0;
 
-    // Loop over block subdivisions
-    for (int time_sub = 0; time_sub < me->wf.time_osr; ++time_sub)
+    int offset =
+        me->wf.num_blocks * me->wf.block_stride;
+
+    float local_max_mag = me->max_mag;
+
+    float * __restrict last_frame = me->last_frame;
+    float * __restrict timedata   = me->timedata;
+    const float * __restrict window = me->window;
+
+    uint8_t * __restrict wf_mag = me->wf.mag;
+
+    typedef struct {
+        float r;
+        float i;
+    } cpx_t;
+
+    const cpx_t *freqdata =
+        (const cpx_t *)me->freqdata;
+
+    for (int time_sub = 0;
+         time_sub < time_osr;
+         ++time_sub)
     {
-      // Shift the new data into analysis frame
-        for (int pos = 0; pos < me->nfft - me->subblock_size; ++pos)
+        /*
+         * Shift the previous FFT frame left by subblock samples.
+         *
+         * Example:
+         *
+         * nfft=4096, subblock=1024
+         *
+         * old:
+         * [---------------- 4096 ----------------]
+         *
+         * new:
+         * [---------- 3072 ----------][--1024--]
+         *
+         * The last 1024 samples are replaced by the
+         * new input samples.
+         */
+        const int keep = nfft - subblock;
+
+        if (keep > 0)
         {
-            me->last_frame[pos] = me->last_frame[pos + me->subblock_size];
-        }
-        for (int pos = me->nfft - me->subblock_size; pos < me->nfft; ++pos)
-        {
-            me->last_frame[pos] = frame[frame_pos];
-            ++frame_pos;
+            memmove(
+                last_frame,
+                last_frame + subblock,
+                keep * sizeof(float));
         }
 
-        // Compute windowed analysis frame
-        for (int pos = 0; pos < me->nfft; ++pos)
+        memcpy(
+            last_frame + keep,
+            frame + frame_pos,
+            subblock * sizeof(float));
+
+        frame_pos += subblock;
+
+        /*
+         * Window and normalize.
+         */
+        for (int i = 0; i < nfft; ++i)
         {
-          me->timedata[pos] = me->fft_norm * me->window[pos] * me->last_frame[pos];
+            timedata[i] =
+                fft_norm *
+                window[i] *
+                last_frame[i];
         }
 
-        kiss_fftr(me->fft_cfg, me->timedata, me->freqdata);
+        /*
+         * FFT.
+         */
+#if defined ARDUINO_ARCH_ESP32
 
-        // Loop over two possible frequency bin offsets (for averaging)
-        for (int freq_sub = 0; freq_sub < me->wf.freq_osr; ++freq_sub)
+        esp_dsp_fftr(
+            me->fft_cfg,
+            timedata,
+            (float *)me->freqdata,
+            me->nfft
+        );
+        // kiss_fftr(
+        //     me->fft_cfg,
+        //     timedata,
+        //     me->freqdata);
+
+
+#else
+
+        kiss_fftr(
+            me->fft_cfg,
+            timedata,
+            me->freqdata);
+
+#endif
+
+        /*
+         * Convert FFT bins into waterfall magnitudes.
+         *
+         * freq_osr=1:
+         *
+         *   FFT bins:
+         *   0,1,2,...2047
+         *
+         * freq_osr=2:
+         *
+         *   FFT bins:
+         *   0,1,2,...4095
+         *
+         * We keep the two interleaved frequency grids.
+         */
+        for (int freq_sub = 0;
+             freq_sub < freq_osr;
+             ++freq_sub)
         {
-            for (int bin = 0; bin < me->wf.num_bins; ++bin)
+            for (int bin = 0;
+                 bin < num_bins;
+                 ++bin)
             {
-                int src_bin = (bin * me->wf.freq_osr) + freq_sub;
-                float mag2 = (me->freqdata[src_bin].i * me->freqdata[src_bin].i) + (me->freqdata[src_bin].r * me->freqdata[src_bin].r);
-                float db = 10.0f * log10f(1E-12f + mag2);
-                // Scale decibels to unsigned 8-bit range and clamp the value
-                // Range 0-240 covers -120..0 dB in 0.5 dB steps
-                int scaled = (int)(2 * db + 240);
+                const int src_bin =
+                    bin * freq_osr + freq_sub;
 
-                me->wf.mag[offset] = (scaled < 0) ? 0 : ((scaled > 255) ? 255 : scaled);
-                ++offset;
+                const float real_part =
+                    freqdata[src_bin].r;
 
-                if (db > me->max_mag)
-                    me->max_mag = db;
+                const float imag_part =
+                    freqdata[src_bin].i;
+
+                const float mag2 =
+                    real_part * real_part +
+                    imag_part * imag_part;
+
+                const float db =
+                    3.0102999566f *
+                    fast_log2f(1E-12f + mag2);
+
+                int scaled =
+                    (int)(2.0f * db + 240.0f);
+
+                if (scaled < 0)
+                    scaled = 0;
+                else if (scaled > 255)
+                    scaled = 255;
+
+                wf_mag[offset++] =
+                    (uint8_t)scaled;
+
+                if (db > local_max_mag)
+                    local_max_mag = db;
             }
         }
     }
 
+    me->max_mag = local_max_mag;
+
+    /*
+     * One complete 160-ms block has now been added.
+     */
     ++me->wf.num_blocks;
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    LOG(LOG_DEBUG,
+        "[ft8] monitor_process: %.3f ms\n",
+        elapsed_ms(&t0, &t1));
 }
+
 
 void monitor_reset(monitor_t* me)
 {
@@ -357,12 +716,6 @@ static float estimate_candidate_snr_db_2500(const waterfall_t *wf, const candida
   return snr_2500_db;
 }
 
-static double elapsed_ms(const struct timespec *t0, const struct timespec *t1)
-{
-  long sec = t1->tv_sec - t0->tv_sec;
-  long nsec = t1->tv_nsec - t0->tv_nsec;
-  return (double)sec * 1000.0 + (double)nsec / 1000000.0;
-}
 
 // ------------------------------------------------------------------------------------
 // Process a buffer already loaded from a file
@@ -418,7 +771,7 @@ int process_buffer(float const *signal,int sample_rate, int num_samples, bool is
   message_t **decoded_hashtable = calloc(sizeof(message_t *), kMax_decoded_messages);
 
   clock_gettime(CLOCK_MONOTONIC, &t_dec0);
-  LOG(LOG_DEBUG, "Found %d candidates with score from %d in %.3f milliseconds\n", num_candidates, kMin_score, elapsed_ms(&t_wf1, &t_dec0));
+  LOG(LOG_INFO, "Found %d candidates with score from %d in %.3f milliseconds\n", num_candidates, kMin_score, elapsed_ms(&t_wf1, &t_dec0));
 
   // Go over candidates and attempt to decode messages
   for (int idx = 0; idx < num_candidates; ++idx){
@@ -480,7 +833,20 @@ int process_buffer(float const *signal,int sample_rate, int num_samples, bool is
         // Fill the empty hashtable slot
         decoded[idx_hash] = message;
         decoded_hashtable[idx_hash] = &decoded[idx_hash];
-        ++num_decoded;
+  
+        fprintf(stdout,"%4d/%02d/%02d %02d:%02d:%02d %3d %+4.3lf %'.1lf ~ %s\n",
+            tmp->tm_year + 1900,
+            tmp->tm_mon + 1,
+            tmp->tm_mday,
+            tmp->tm_hour,
+            tmp->tm_min,
+            tmp->tm_sec,
+            (int)lroundf(message.snr_db),
+            message.time_sec,
+            message.freq_hz,
+            message.text);
+        
+            ++num_decoded;
       }
   }
   
@@ -500,17 +866,17 @@ int process_buffer(float const *signal,int sample_rate, int num_samples, bool is
     if(mp == NULL)
       continue; // Shouldn't happen
 
-    fprintf(stdout,"%4d/%02d/%02d %02d:%02d:%02d %3d %+4.2lf %'.1lf ~ %s\n",
-	    tmp->tm_year + 1900,
-	    tmp->tm_mon + 1,
-	    tmp->tm_mday,
-	    tmp->tm_hour,
-	    tmp->tm_min,
-	    tmp->tm_sec,
-      (int)lroundf(mp->snr_db),
-	    tbase + mp->time_sec,
-	    1.0e6 * base_freq + mp->freq_hz,
-      mp->text);
+    // fprintf(stdout,"%4d/%02d/%02d %02d:%02d:%02d %3d %+4.3lf %'.1lf ~ %s\n",
+	  //   tmp->tm_year + 1900,
+	  //   tmp->tm_mon + 1,
+	  //   tmp->tm_mday,
+	  //   tmp->tm_hour,
+	  //   tmp->tm_min,
+	  //   tmp->tm_sec,
+    //   (int)lroundf(mp->snr_db),
+	  //   tbase + mp->time_sec,
+	  //   mp->freq_hz,
+    //   mp->text);
   }
   free(decoded);
   free(decoded_hashtable);

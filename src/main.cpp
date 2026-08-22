@@ -17,6 +17,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_heap_caps.h>
+#include "esp_dsp.h"
 #else
 #include <cstdlib>   // malloc, free
 #include <cstring>   // memcmp
@@ -187,9 +188,9 @@ static void decode_task(void* /*arg*/)
 
 void setup()
 {
-    Serial.begin(115200);
+    Serial.begin(921600);
     while (!Serial) delay(10);
-    delay(1500);
+    delay(2500);
     
     Serial.println("\n[ft8] FT8 decoder starting");
     Serial.printf("[ft8] Free heap: %lu bytes\n", (unsigned long)ESP.getFreeHeap());

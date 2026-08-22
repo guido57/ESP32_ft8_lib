@@ -171,7 +171,180 @@ static int ft4_sync_score(const waterfall_t* wf, const candidate_t* candidate)
     return score;
 }
 
-int ft8_find_sync(const waterfall_t* wf, int num_candidates, candidate_t heap[], int min_score)
+// Funzione interna ottimizzata a interi puri
+static inline __attribute__((always_inline)) int ft8_sync_score_optimized(const waterfall_t* wf, const candidate_t* candidate)
+{
+    int score = 0;
+    int num_average = 0;
+    
+    // Inlining del calcolo dell'indice originale per evitare salti di funzione
+    int offset = candidate->time_offset;
+    offset = (offset * wf->time_osr) + candidate->time_sub;
+    offset = (offset * wf->freq_osr) + candidate->freq_sub;
+    offset = (offset * wf->num_bins) + candidate->freq_offset;
+    
+    const uint8_t* mag_cand = wf->mag + offset;
+    const int time_offset = candidate->time_offset;
+    const int num_blocks = wf->num_blocks;
+    const int block_stride = wf->block_stride;
+
+    for (int m = 0; m < FT8_NUM_SYNC; ++m)
+    {
+        for (int k = 0; k < FT8_LENGTH_SYNC; ++k)
+        {
+            int block = (FT8_SYNC_OFFSET * m) + k;
+            int block_abs = time_offset + block;
+
+            // Rimosso il controllo (block_abs < 0) perché time_offset parte da 5
+            if (block_abs >= num_blocks) break;
+
+            const uint8_t* p8 = mag_cand + (block * block_stride);
+            int sm = kFT8_Costas_pattern[k];
+
+            // Sfruttiamo operazioni intere dirette
+            if (sm > 0) { score += p8[sm] - p8[sm - 1]; ++num_average; }
+            if (sm < 7) { score += p8[sm] - p8[sm + 1]; ++num_average; }
+            
+            // Semplificato il controllo temporale precedente (block_abs è sempre > 0 qui)
+            if (k > 0) { score += p8[sm] - p8[sm - block_stride]; ++num_average; }
+            if (((k + 1) < FT8_LENGTH_SYNC) && ((block_abs + 1) < num_blocks)) { score += p8[sm] - p8[sm + block_stride]; ++num_average; }
+        }
+    }
+
+    if (num_average > 0) score /= num_average; // Divisione hardware intera nativa
+    return score;
+}
+
+// Versione definitiva consolidata al massimo delle performance stabili
+__attribute__((section(".iram1.text"))) int ft8_find_sync(const waterfall_t* wf, int num_candidates, candidate_t heap[], int min_score)
+{
+    int heap_size = 0;
+    candidate_t candidate;
+    const bool is_ft4 = (wf->protocol == PROTO_FT4);
+
+    // Buffer istantaneo nello stack
+    int max_freq_offset = wf->num_bins - 7;
+    int* score_buf = (int*)alloca(max_freq_offset * sizeof(int));
+
+    for (candidate.time_sub = 0; candidate.time_sub < wf->time_osr; ++candidate.time_sub)
+    {
+        for (candidate.freq_sub = 0; candidate.freq_sub < wf->freq_osr; ++candidate.freq_sub)
+        {
+            for (candidate.time_offset = 5; candidate.time_offset < 20; ++candidate.time_offset)
+            {
+                if (is_ft4)
+                {
+                    for (candidate.freq_offset = 0; candidate.freq_offset < max_freq_offset; ++candidate.freq_offset)
+                    {
+                        candidate.score = ft4_sync_score(wf, &candidate);
+                        if (candidate.score < min_score) continue;
+                        if (heap_size == num_candidates && candidate.score > heap[0].score)
+                        {
+                            heap[0] = heap[heap_size - 1]; --heap_size; heapify_down(heap, heap_size);
+                        }
+                        if (heap_size < num_candidates)
+                        {
+                            heap[heap_size] = candidate; ++heap_size; heapify_up(heap, heap_size);
+                        }
+                    }
+                    continue;
+                }
+
+                // --- CORE FT8 OTTIMIZZATO ---
+                for (int f = 0; f < max_freq_offset; ++f) {
+                    score_buf[f] = 0;
+                }
+                int num_average = 0;
+
+                int offset_base = candidate.time_offset;
+                offset_base = (offset_base * wf->time_osr) + candidate.time_sub;
+                offset_base = (offset_base * wf->freq_osr) + candidate.freq_sub;
+                offset_base = (offset_base * wf->num_bins);
+
+                const int stride = wf->block_stride;
+                const int num_blocks = wf->num_blocks;
+
+                for (int m = 0; m < FT8_NUM_SYNC; ++m)
+                {
+                    int block_sync_offset = FT8_SYNC_OFFSET * m;
+                    for (int k = 0; k < FT8_LENGTH_SYNC; ++k)
+                    {
+                        int block = block_sync_offset + k;
+                        int block_abs = candidate.time_offset + block;
+
+                        if (block_abs >= num_blocks) break;
+
+                        int sm = kFT8_Costas_pattern[k];
+                        const uint8_t* p8_row = wf->mag + offset_base + (block * stride);
+
+                        // Calcolo dei limiti temporali e strutturali per questa riga Costas
+                        bool do_sm_minus = (sm > 0);
+                        bool do_sm_plus  = (sm < 7);
+                        bool do_k_minus  = (k > 0);
+                        bool do_k_plus   = (((k + 1) < FT8_LENGTH_SYNC) && ((block_abs + 1) < num_blocks));
+
+                        num_average += (do_sm_minus + do_sm_plus + do_k_minus + do_k_plus);
+
+                        // Loop interno lineare ad altissima efficienza di cache
+                        for (int f = 0; f < max_freq_offset; ++f)
+                        {
+                            const uint8_t* p8 = p8_row + f;
+                            int s = 0;
+
+                            if (do_sm_minus) s += p8[sm] - p8[sm - 1];
+                            if (do_sm_plus)  s += p8[sm] - p8[sm + 1];
+                            if (do_k_minus)  s += p8[sm] - p8[sm - stride];
+                            if (do_k_plus)   s += p8[sm] - p8[sm + stride];
+
+                            score_buf[f] += s;
+                        }
+                    }
+                }
+
+                // Inserimento sicuro nell'Heap
+                if (num_average > 0)
+                {
+                    for (int f = 0; f < max_freq_offset; ++f)
+                    {
+                        int final_score = score_buf[f] / num_average;
+                        if (final_score < min_score) continue;
+
+                        candidate.freq_offset = f;
+                        candidate.score = final_score;
+
+                        if (heap_size == num_candidates && candidate.score > heap[0].score)
+                        {
+                            heap[0] = heap[heap_size - 1];
+                            --heap_size;
+                            heapify_down(heap, heap_size);
+                        }
+                        if (heap_size < num_candidates)
+                        {
+                            heap[heap_size] = candidate;
+                            ++heap_size;
+                            heapify_up(heap, heap_size);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Ordinamento finale
+    int len_unsorted = heap_size;
+    while (len_unsorted > 1)
+    {
+        candidate_t tmp = heap[len_unsorted - 1];
+        heap[len_unsorted - 1] = heap[0];
+        heap[0] = tmp;
+        len_unsorted--;
+        heapify_down(heap, len_unsorted);
+    }
+    return heap_size;
+}
+
+
+int ft8_find_sync_ori(const waterfall_t* wf, int num_candidates, candidate_t heap[], int min_score)
 {
     int heap_size = 0;
     candidate_t candidate;
@@ -183,7 +356,7 @@ int ft8_find_sync(const waterfall_t* wf, int num_candidates, candidate_t heap[],
     {
         for (candidate.freq_sub = 0; candidate.freq_sub < wf->freq_osr; ++candidate.freq_sub)
         {
-            for (candidate.time_offset = -12; candidate.time_offset < 24; ++candidate.time_offset)
+            for (candidate.time_offset = 5; candidate.time_offset < 20; ++candidate.time_offset)
             {
                 for (candidate.freq_offset = 0; (candidate.freq_offset + 7) < wf->num_bins; ++candidate.freq_offset)
                 {
