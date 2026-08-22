@@ -11,8 +11,6 @@
 #include <libgen.h>
 #include <assert.h>
 #include <time.h>
-#include <esp_heap_caps.h>
-
 #include "ft8/decode.h"
 #include "ft8/constants.h"
 #include "ft8/ft8_config.h"
@@ -21,8 +19,14 @@
 #include "common/debug.h"
 #include "fft/kiss_fftr.h"
 #include "fft/kiss_fft.h"
-
+#if defined(ARDUINO_ARCH_ESP32)
+#include <esp_heap_caps.h>
 #include "fft/esp-dsp.h"
+#else
+#define heap_caps_malloc(size, caps) malloc(size)   
+#define heap_caps_free(ptr) free(ptr)
+#endif
+
 
 #ifndef LOG_LEVEL
 #define LOG_LEVEL LOG_DEBUG
@@ -131,8 +135,6 @@ typedef struct
 #if defined ARDUINO_ARCH_ESP32
 #include "esp_heap_caps.h"
 #endif
-
-#include "esp_heap_caps.h"
 
 void monitor_init(monitor_t* me, const monitor_config_t* cfg)
 {

@@ -28,7 +28,7 @@
 #endif
 
 #ifndef FT8_MAX_CANDIDATES
-#define FT8_MAX_CANDIDATES 120
+#define FT8_MAX_CANDIDATES 50
 #endif
 
 #ifndef FT8_LDPC_ITERATIONS
@@ -44,7 +44,7 @@
 #endif
 
 #ifndef FT8_TIME_OSR
-#define FT8_TIME_OSR 2
+#define FT8_TIME_OSR 4
 #endif
 
 #ifndef FT8_SNR_RAW_SCALE
