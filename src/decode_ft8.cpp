@@ -14,6 +14,7 @@
 #include "ft8/decode.h"
 #include "ft8/constants.h"
 #include "ft8/ft8_config.h"
+#include "subtract.h"
 
 #include "common/wave.h"
 #include "common/debug.h"
@@ -32,6 +33,11 @@
 #define LOG_LEVEL LOG_DEBUG
 #endif
 
+extern "C" void pack_bits(const uint8_t bit_array[], int num_bits, uint8_t packed[]);
+extern "C" void ft8_encode(const uint8_t* payload, uint8_t* tones);
+extern "C" void kiss_fftr(const kiss_fftr_cfg cfg, const kiss_fft_scalar *timedata, kiss_fft_cpx *freqdata);    
+
+
 const int kMin_score = FT8_MIN_SCORE; // Minimum sync score threshold for candidates
 const int kMax_candidates = FT8_MAX_CANDIDATES; // for 12 kHz sample rate; scaled for other sample rates
 const int kLDPC_iterations = FT8_LDPC_ITERATIONS;
@@ -42,6 +48,9 @@ const int kMax_decoded_messages = FT8_MAX_DECODED_MSGS;
 
 const int kFreq_osr = FT8_FREQ_OSR; // Frequency oversampling rate (bin subdivision)
 const int kTime_osr = FT8_TIME_OSR; // Time oversampling rate (symbol subdivision)
+
+
+
 static float hann_i(int i, int N)
 {
     float x = sinf((float)M_PI * i / N);
@@ -718,13 +727,41 @@ static float estimate_candidate_snr_db_2500(const waterfall_t *wf, const candida
   return snr_2500_db;
 }
 
+static void
+get_ft8_tones_from_plain174(const uint8_t *plain174,
+                            uint8_t *tones)
+{
+    uint8_t a91[FTX_LDPC_K_BYTES];
+
+    pack_bits(plain174, FTX_LDPC_K, a91);
+
+    uint8_t payload[10];
+    memcpy(payload, a91, 10);
+
+    ft8_encode(payload, tones);
+}
 
 // ------------------------------------------------------------------------------------
 // Process a buffer already loaded from a file
 // Pass precise time of signal[0] (including fractional second) so we can reference to it
 // ------------------------------------------------------------------------------------
-int process_buffer(float const *signal,int sample_rate, int num_samples, bool is_ft8, float base_freq, struct tm const *tmp, double sec){
+int process_buffer(float const *signal,int sample_rate, int num_samples, bool is_ft8, float time_delay, struct tm const *tmp, double sec){
   assert(signal != NULL && tmp != NULL);
+
+    
+    float *work_signal =
+        (float *)malloc((size_t)num_samples * sizeof(float));
+
+    if (work_signal == NULL) {
+        LOG(LOG_ERROR, "Cannot allocate working signal buffer\n");
+        return -1;
+    }
+
+    memcpy(work_signal, signal,
+            (size_t)num_samples * sizeof(float));
+
+  float * samples_ = work_signal;
+  int rate_ = sample_rate;
 
   struct timespec t_wf0 = {0};
   struct timespec t_wf1 = {0};
@@ -768,15 +805,22 @@ int process_buffer(float const *signal,int sample_rate, int num_samples, bool is
   // Hash table for decoded messages (to check for duplicates)
   int num_decoded = 0;
   // Pointer to kMax_decoded_messages-element array of message_t structures
-  message_t *decoded = calloc(sizeof(message_t), kMax_decoded_messages);
+  message_t *decoded = (message_t *) calloc(sizeof(message_t), kMax_decoded_messages);
   // Pointer to kMax_decoded_messsages-element array of pointers to message_t structures
-  message_t **decoded_hashtable = calloc(sizeof(message_t *), kMax_decoded_messages);
+  message_t **decoded_hashtable = (message_t **) calloc(sizeof(message_t *), kMax_decoded_messages);
 
   clock_gettime(CLOCK_MONOTONIC, &t_dec0);
   LOG(LOG_INFO, "Found %d candidates with score from %d in %.3f milliseconds\n", num_candidates, kMin_score, elapsed_ms(&t_wf1, &t_dec0));
 
   // Go over candidates and attempt to decode messages
   for (int idx = 0; idx < num_candidates; ++idx){
+      printf("Candidate %3d: score=%3d, time_offset=%4d, time_sub=%1d, freq_offset=%4d, freq_sub=%1d\n",
+          idx,
+          candidate_list[idx].score,
+          candidate_list[idx].time_offset,
+          candidate_list[idx].time_sub,
+          candidate_list[idx].freq_offset,
+          candidate_list[idx].freq_sub);
       const candidate_t* cand = &candidate_list[idx];
       if (cand->score < kMin_score)
 	      continue;
@@ -798,6 +842,35 @@ int process_buffer(float const *signal,int sample_rate, int num_samples, bool is
         }
         continue;
       }
+
+      printf("DECODED: %3d %+4.2f %4.0f ~  %s\n", cand->score, time_sec, freq_hz, message.text);
+      uint8_t tones[79];
+      get_ft8_tones_from_plain174(plain174, tones);
+      
+      float ts = time_delay;
+      
+      
+      printf("subtracting tones from waterfall... message.freq_hz=%.3f message.time_sec=%.6f num_samples=%d\n", 
+            freq_hz, time_sec, num_samples);
+    //   printf("tones: ");
+    //   for(int i=0; i<79; i++){
+    //     printf("%d ", tones[i]);
+    //   }
+      
+      subtract(tones,
+         freq_hz,
+         freq_hz,
+         ts,
+         samples_,
+         num_samples,
+         sample_rate);
+      printf("SUBTRACT: time=%.6f sec freq=%.3f Hz samples=%d sample_rate=%d\n",
+         ts,
+         freq_hz,
+         num_samples,
+         sample_rate);
+      
+      return 0; // Caller frees signal
 
       message.freq_hz = freq_hz; // Save so we can sort on it and display it
       message.time_sec = time_sec; // Time offset of start from nominal UTC :00/:15/:30/:45 or :00/:07.5/:15/...
@@ -836,13 +909,16 @@ int process_buffer(float const *signal,int sample_rate, int num_samples, bool is
         decoded[idx_hash] = message;
         decoded_hashtable[idx_hash] = &decoded[idx_hash];
   
-        fprintf(stdout,"%4d/%02d/%02d %02d:%02d:%02d %3d %+4.3lf %'.1lf ~ %s\n",
+        fprintf(stdout,"%4d/%02d/%02d %02d:%02d:%02d %3d %.3f %.6f %3d %+5.4lf %'.3lf ~ %s\n",
             tmp->tm_year + 1900,
             tmp->tm_mon + 1,
             tmp->tm_mday,
             tmp->tm_hour,
             tmp->tm_min,
             tmp->tm_sec,
+            idx,
+            freq_hz,
+            time_sec,
             (int)lroundf(message.snr_db),
             message.time_sec,
             message.freq_hz,

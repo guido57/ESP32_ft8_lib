@@ -44,7 +44,7 @@
 #endif
 
 #ifndef FT8_TIME_OSR
-#define FT8_TIME_OSR 4
+#define FT8_TIME_OSR 16
 #endif
 
 #ifndef FT8_SNR_RAW_SCALE

@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <math.h>
 #include <stddef.h>
+#include <stdio.h>
 
 /// Compute log likelihood log(p(1) / p(0)) of 174 message bits for later use in soft-decision LDPC decoding
 /// @param[in] wf Waterfall data collected during message slot
@@ -21,7 +22,7 @@ static void ft8_extract_likelihood(const waterfall_t* wf, const candidate_t* can
 /// @param[in] plain Array of bits (0 and nonzero values) with num_bits entires
 /// @param[in] num_bits Number of bits (entries) passed in bit_array
 /// @param[out] packed Byte-packed bits representing the data in bit_array
-static void pack_bits(const uint8_t bit_array[], int num_bits, uint8_t packed[]);
+void pack_bits(const uint8_t bit_array[], int num_bits, uint8_t packed[]);
 
 static float max2(float a, float b);
 static float max4(float a, float b, float c, float d);
@@ -496,14 +497,23 @@ bool ft8_decode(const waterfall_t* wf, const candidate_t* cand, message_t* messa
     }
     else
     {
+        // printf("Extracting likelihood for FT8 candidate at time_offset=%d, freq_offset=%d\n", cand->time_offset, cand->freq_offset);
         ft8_extract_likelihood(wf, cand, log174);
     }
 
+    // printf("Likelihoods before normalization:\n");
     ftx_normalize_logl(log174);
 
     uint8_t plain174[FTX_LDPC_N]; // message bits (0/1)
+    // printf("Decoding LDPC with max_iterations=%d\n", max_iterations);
     bp_decode(log174, max_iterations, plain174, &status->ldpc_errors);
-    // ldpc_decode(log174, max_iterations, plain174, &status->ldpc_errors);
+    if (plain != NULL)
+        {
+            for (int i = 0; i < FTX_LDPC_N; ++i)
+            {
+                plain[i] = plain174[i];
+            }
+        }
 
     if (status->ldpc_errors > 0)
     {
@@ -512,13 +522,16 @@ bool ft8_decode(const waterfall_t* wf, const candidate_t* cand, message_t* messa
 
     // Extract payload + CRC (first FTX_LDPC_K bits) packed into a byte array
     uint8_t a91[FTX_LDPC_K_BYTES];
+    // printf("Packing bits into byte array for CRC extraction\n");
     pack_bits(plain174, FTX_LDPC_K, a91);
 
     // Extract CRC and check it
+    // printf("Extracting CRC from packed bits\n");
     status->crc_extracted = ftx_extract_crc(a91);
     // [1]: 'The CRC is calculated on the source-encoded message, zero-extended from 77 to 82 bits.'
     a91[9] &= 0xF8;
     a91[10] &= 0x00;
+    // printf("Calculating CRC on zero-extended message\n");
     status->crc_calculated = ftx_compute_crc(a91, 96 - 14);
 
     if (status->crc_extracted != status->crc_calculated)
@@ -533,17 +546,12 @@ bool ft8_decode(const waterfall_t* wf, const candidate_t* cand, message_t* messa
         for (int i = 0; i < 10; ++i)
         {
 
-        if (plain != NULL)
-        {
-            for (int i = 0; i < FTX_LDPC_N; ++i)
-            {
-                plain[i] = plain174[i];
-            }
-        }
+        
             a91[i] ^= kFT4_XOR_sequence[i];
         }
     }
 
+    // printf("Unpacking 77 bits from byte array\n");
     status->unpack_status = unpack77(a91, message->text);
 
     if (status->unpack_status < 0)
@@ -706,7 +714,7 @@ static void ft8_decode_multi_symbols(const uint8_t* wf, int num_bins, int n_syms
 
 // Packs a string of bits each represented as a zero/non-zero byte in plain[],
 // as a string of packed bits starting from the MSB of the first byte of packed[]
-static void pack_bits(const uint8_t bit_array[], int num_bits, uint8_t packed[])
+void pack_bits(const uint8_t bit_array[], int num_bits, uint8_t packed[])
 {
     int num_bytes = (num_bits + 7) / 8;
     for (int i = 0; i < num_bytes; ++i)

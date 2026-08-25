@@ -26,7 +26,8 @@
 #include <unistd.h>
 #endif
 
-#include "ft8/decoder_api.h"
+#include "decoder_api.h"
+
 
 #if defined(ARDUINO_ARCH_ESP32)
 
@@ -233,15 +234,15 @@ static float* alloc_sample_buffer(size_t count)
 
 int main(int argc, char** argv)
 {
-    if (argc < 2) {
+    if (argc < 3) {
         fprintf(stderr, "Usage: %s <wavfile> [base_freq_mhz]\n", argv[0]);
         return 2;
     }
     
     const char* wav_path = argv[1];
-    float base_freq_mhz = 14.074f;
+    float time_delay = 0.0f;
     if (argc >= 3) {
-        base_freq_mhz = (float)atof(argv[2]);
+        time_delay = (float)atof(argv[2]);
     }
     
     int fd = open(wav_path, O_RDONLY);
@@ -263,7 +264,7 @@ int main(int argc, char** argv)
     
     ft8_decode_context_t ctx = {0};
     ctx.is_ft8 = true;
-    ctx.base_freq_mhz = base_freq_mhz;
+    ctx.time_delay = time_delay;
     
     struct timespec t0 = {0};
     struct timespec t1 = {0};

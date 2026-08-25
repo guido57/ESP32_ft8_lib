@@ -39,8 +39,20 @@ extern "C"
     char charn(int c, int table_idx);
     int nchar(char c, int table_idx);
 
+
+    typedef enum
+    {
+        FT8_CHAR_TABLE_FULL,                 // table[42] " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-./?"
+        FT8_CHAR_TABLE_ALPHANUM_SPACE_SLASH, // table[38] " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/"
+        FT8_CHAR_TABLE_ALPHANUM_SPACE,       // table[37] " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        FT8_CHAR_TABLE_LETTERS_SPACE,        // table[27] " ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        FT8_CHAR_TABLE_ALPHANUM,             // table[36] "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        FT8_CHAR_TABLE_NUMERIC,              // table[10] "0123456789"
+    } ft8_char_table_e;
+
+
 #ifdef __cplusplus
 }
-#endif
+#endif 
 
 #endif // _INCLUDE_TEXT_H_

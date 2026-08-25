@@ -5,7 +5,7 @@
 #include <time.h>
 
 #ifdef __cplusplus
-extern "C" {
+// extern "C" {
 #endif
 
 // Metadata passed to one FT8/FT4 decode call.
@@ -14,6 +14,7 @@ typedef struct {
     float base_freq_mhz;
     struct tm utc;
     double utc_frac_sec;
+    float time_delay; // Time delay in seconds
 } ft8_decode_context_t;
 
 // Decode a single audio slot from floating-point samples.
@@ -21,7 +22,7 @@ typedef struct {
 int ft8_decode_slot(const float* signal, int sample_rate, int num_samples, const ft8_decode_context_t* ctx);
 
 #ifdef __cplusplus
-}
+// }
 #endif
 
 #endif

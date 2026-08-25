@@ -19,7 +19,7 @@ static uint8_t parity8(uint8_t x)
 // Arguments:
 // [IN] message   - array of 91 bits stored as 12 bytes (MSB first)
 // [OUT] codeword - array of 174 bits stored as 22 bytes (MSB first)
-static void encode174(const uint8_t* message, uint8_t* codeword)
+void encode174(const uint8_t* message, uint8_t* codeword)
 {
     // This implementation accesses the generator bits straight from the packed binary representation in kFTX_LDPC_generator
 
