@@ -761,7 +761,22 @@ int process_buffer(float const *signal,int sample_rate, int num_samples, bool is
             (size_t)num_samples * sizeof(float));
 
   float * samples_ = work_signal;
-  int rate_ = sample_rate;
+
+  // Preserve results across both conventional-cancellation passes.
+  int num_decoded = 0;
+  message_t *decoded =
+      (message_t *)calloc(sizeof(message_t), kMax_decoded_messages);
+  message_t **decoded_hashtable =
+      (message_t **)calloc(sizeof(message_t *), kMax_decoded_messages);
+  if (decoded == NULL || decoded_hashtable == NULL) {
+    free(decoded);
+    free(decoded_hashtable);
+    free(work_signal);
+    LOG(LOG_ERROR, "Cannot allocate decoded-message table\n");
+    return -1;
+  }
+
+  for (int pass = 0; pass < 2; ++pass) {
 
   struct timespec t_wf0 = {0};
   struct timespec t_wf1 = {0};
@@ -788,7 +803,7 @@ int process_buffer(float const *signal,int sample_rate, int num_samples, bool is
   for (int frame_pos = 0; frame_pos + mon.block_size <= num_samples; frame_pos += mon.block_size){
       // Process the waveform data frame by frame - you could have a live loop here with data from an audio device
       // (cool, now that we can get sample timings - KA9Q)
-      monitor_process(&mon, signal + frame_pos);
+      monitor_process(&mon, samples_ + frame_pos);
   }
 
  clock_gettime(CLOCK_MONOTONIC, &t_wf1);
@@ -801,13 +816,6 @@ int process_buffer(float const *signal,int sample_rate, int num_samples, bool is
   int const candidate_size = (mon_cfg.f_max * kMax_candidates) / 3000; // Scale by bandwidth relative to the original 3 kHz
   candidate_t candidate_list[candidate_size];
   int num_candidates = ft8_find_sync(&mon.wf, candidate_size, candidate_list, kMin_score);
-
-  // Hash table for decoded messages (to check for duplicates)
-  int num_decoded = 0;
-  // Pointer to kMax_decoded_messages-element array of message_t structures
-  message_t *decoded = (message_t *) calloc(sizeof(message_t), kMax_decoded_messages);
-  // Pointer to kMax_decoded_messsages-element array of pointers to message_t structures
-  message_t **decoded_hashtable = (message_t **) calloc(sizeof(message_t *), kMax_decoded_messages);
 
   clock_gettime(CLOCK_MONOTONIC, &t_dec0);
   LOG(LOG_INFO, "Found %d candidates with score from %d in %.3f milliseconds\n", num_candidates, kMin_score, elapsed_ms(&t_wf1, &t_dec0));
@@ -843,34 +851,8 @@ int process_buffer(float const *signal,int sample_rate, int num_samples, bool is
         continue;
       }
 
-      printf("DECODED: %3d %+4.2f %4.0f ~  %s\n", cand->score, time_sec, freq_hz, message.text);
       uint8_t tones[79];
       get_ft8_tones_from_plain174(plain174, tones);
-      
-      float ts = time_delay;
-      
-      
-      printf("subtracting tones from waterfall... message.freq_hz=%.3f message.time_sec=%.6f num_samples=%d\n", 
-            freq_hz, time_sec, num_samples);
-    //   printf("tones: ");
-    //   for(int i=0; i<79; i++){
-    //     printf("%d ", tones[i]);
-    //   }
-      
-      subtract(tones,
-         freq_hz,
-         freq_hz,
-         ts,
-         samples_,
-         num_samples,
-         sample_rate);
-      printf("SUBTRACT: time=%.6f sec freq=%.3f Hz samples=%d sample_rate=%d\n",
-         ts,
-         freq_hz,
-         num_samples,
-         sample_rate);
-      
-      return 0; // Caller frees signal
 
       message.freq_hz = freq_hz; // Save so we can sort on it and display it
       message.time_sec = time_sec; // Time offset of start from nominal UTC :00/:15/:30/:45 or :00/:07.5/:15/...
@@ -924,41 +906,31 @@ int process_buffer(float const *signal,int sample_rate, int num_samples, bool is
             message.freq_hz,
             message.text);
         
-            ++num_decoded;
+        ++num_decoded;
+
+        // Conventional cancellation is applied only once per unique decode.
+        const float fine_delay = refine_ft8_delay(
+            samples_, num_samples, tones, time_sec - 0.14f, freq_hz, idx);
+        const float fine_freq = refine_ft8_frequency(
+            samples_, num_samples, tones, fine_delay, freq_hz);
+        printf("subtracting tones from waterfall... message.freq_hz=%.3f message.time_sec=%.6f num_samples=%d\n",
+               freq_hz, time_sec, num_samples);
+        subtract(tones, fine_freq, fine_freq, fine_delay,
+                 samples_, num_samples, sample_rate);
+        printf("SUBTRACT: time=%.6f sec freq=%.3f Hz samples=%d sample_rate=%d\n",
+               fine_delay, fine_freq, num_samples, sample_rate);
       }
   }
   
   clock_gettime(CLOCK_MONOTONIC, &t_dec1);
-  LOG(LOG_INFO, "On %d candidates, decoded %d messages in %.3f ms\n", num_candidates, num_decoded, elapsed_ms(&t_dec0, &t_dec1));
-  LOG(LOG_INFO, "Decoded %d messages\n", num_decoded);
+  LOG(LOG_INFO, "Pass %d: %d candidates, %d unique messages in %.3f ms\n",
+      pass, num_candidates, num_decoded, elapsed_ms(&t_dec0, &t_dec1));
   
-  // Decoded messages are spread throughout hash table, so sort the whole thing including null entries
-  qsort(decoded_hashtable, kMax_decoded_messages, sizeof *decoded_hashtable, mcompare);
-  // Empty entries sorted to top, so first num_decoded elements of decoded_hashtable are valid
-  double tbase = tmp->tm_sec; // Full seconds and fraction in minute, should be just above (not below) period multiple
-  tbase = is_ft8 ? fmod(tbase,15.0) : fmod(tbase,7.5); // seconds after start of cycle (0/15/30/45 or 0/7.5/15/etc)
-  tbase += sec; // sec could be negative, so add it only now
+  monitor_free(&mon);
+  } // conventional cancellation passes
 
-  for(int i=0; i < num_decoded; i++){
-    message_t const *mp = decoded_hashtable[i];
-    if(mp == NULL)
-      continue; // Shouldn't happen
-
-    // fprintf(stdout,"%4d/%02d/%02d %02d:%02d:%02d %3d %+4.3lf %'.1lf ~ %s\n",
-	  //   tmp->tm_year + 1900,
-	  //   tmp->tm_mon + 1,
-	  //   tmp->tm_mday,
-	  //   tmp->tm_hour,
-	  //   tmp->tm_min,
-	  //   tmp->tm_sec,
-    //   (int)lroundf(mp->snr_db),
-	  //   tbase + mp->time_sec,
-	  //   mp->freq_hz,
-    //   mp->text);
-  }
   free(decoded);
   free(decoded_hashtable);
-
-  monitor_free(&mon);
+  free(work_signal);
   return 0; // Caller frees signal
 }

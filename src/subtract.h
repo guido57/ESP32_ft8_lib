@@ -30,4 +30,52 @@ void subtract(const uint8_t * tones,
               size_t num_samples,
               int sample_rate);
 
+void diagnose_subtraction(
+    float *samples,
+    size_t num_samples,
+    const uint8_t *tones,
+    double freq,
+    double delay,
+    int sample_rate);
+
+float refine_ft8_delay(
+    const float* samples,
+    int num_samples,
+    const uint8_t* tones,
+    float delay0,
+    float freq,
+    int cand_to_print);
+
+    struct complex_amp_t
+{
+    double amplitude;
+    double phase;
+    double ci;
+    double cq;
+};
+
+    complex_amp_t estimate_amplitude_phase(
+    float *samples,
+    int num_samples,
+    uint8_t *tones,
+    float delay,
+    float freq);
+
+
+    float refine_ft8_frequency(
+    const float *samples,
+    int num_samples,
+    const uint8_t *tones,
+    float delay,
+    float freq_coarse);
+
+    float refine_ft8_frequency_costas(
+    const float *samples,
+    int num_samples,
+    const uint8_t *tones,
+    float delay,
+    float freq_coarse);
+
+
+
 #endif
