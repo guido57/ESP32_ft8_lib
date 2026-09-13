@@ -145,72 +145,79 @@ void ft8lib_encode(const uint8_t* payload, uint8_t* tones)
 
 static void test_synthesize_ft8()
 {
-    const char *msg = "CQ IW5ALZ JN53";
+    
+    const char *wav_path = "test_real_ft8.wav";
     constexpr int sample_rate = 12000;
     constexpr int nsamples = 15 * sample_rate;
-    const double hz0 = 1500.0;
-    const double offset = 2.5; // 2500 ms
-    const double amplitude = 0.5;
-    const char *wav_path = "test_real_ft8.wav";
-
-    printf("\nSynthesize the FT8 message %s at sample rate %d with time_offset %.3f into %s\n", msg, sample_rate, offset, wav_path);
-
+        
     
-    std::vector<float> samples(nsamples, 0.0f);
-
-    // --------------------------------------------------
-    // Encode real FT8 message
-    // --------------------------------------------------
-
-    ftx_message_t m;
-
-    if (ftx_message_encode(&m, nullptr, msg) != FTX_MESSAGE_RC_OK)
-    {
-        printf("ERROR: cannot encode message: %s\n", msg);
-        return;
-    }
-
-    uint8_t tones[79] = {
+    const char *msg1 = " G0XYZ K1ABC FN43";
+    const double hz0_1 = 1500.0;
+    const double offset1 = 2.0; // 2000 ms
+    const double amplitude1 = 0.1;
+    uint8_t tones_K1ABC[79] = {
     3, 1, 4, 0, 6, 5, 2,
     0, 3, 1, 7, 4, 5, 2, 6, 4, 5, 0, 5, 4, 7, 6, 7, 0, 4, 6, 0, 6, 0, 2, 1, 4, 3, 2, 0, 5,
     3, 1, 4, 0, 6, 5, 2,
     6, 4, 0, 4, 0, 1, 3, 6, 5, 0, 5, 4, 5, 4, 5, 0, 7, 0, 6, 4, 0, 4, 1, 1, 4, 0, 0, 4, 2,
     3, 1, 4, 0, 6, 5, 2
     };
-    // ft8lib_encode(m.payload, tones);
 
-    printf("Message : %s\n", msg);
-    printf("Rate    : %d Hz\n", sample_rate);
-    printf("Frequency: %.3f Hz\n", hz0);
-    printf("Offset  : %.3f ms\n", offset * 1000.0);
-    printf("Amplitude: %.3f\n", amplitude);
+    const char *msg2 = "CQ IK4LZH JN54";
+    const double hz0_2 = 1515.0;
+    const double offset2 = 1.5; // 1500 ms
+    const double amplitude2 = 0.005;
+    const uint8_t tones_IK4LZH[79] = {
+    3, 1, 4, 0, 6, 5, 2, 
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 6, 0, 4, 2, 2, 7, 5, 4, 1, 0, 5, 5, 5, 5, 3, 2, 0, 2, 
+    3, 1, 4, 0, 6, 5, 2, 
+    7, 6, 6, 5, 2, 3, 3, 4, 1, 1, 3, 6, 1, 2, 1, 2, 2, 1, 4, 1, 1, 5, 3, 7, 0, 2, 4, 2, 3, 
+    3, 1, 4, 0, 6, 5, 2
+    };
 
-    printf("Tones:\n");
+    std::vector<float> samples(nsamples, 0.0f);
 
-    for (int i = 0; i < 79; ++i)
-    {
-        printf("%d%s",
-               tones[i],
-               (i == 78) ? "\n" : " ");
-    }
-
+    
+    // printf("Tones (K1ABC):\n");
+    // for (int i = 0; i < 79; ++i)
+    // {
+    //     printf("%d%s",
+    //            tones_K1ABC[i],
+    //            (i == 78) ? "\n" : " ");
+    // }
     // --------------------------------------------------
     // Synthesize
     // --------------------------------------------------
 
-    std::vector<double> amps(79, amplitude);
-    std::vector<double> phases(79, 0.0);
+    std::vector<double> amps1(79, amplitude1);
+    std::vector<double> phases1(79, 0.0);
+    std::vector<double> amps2(79, amplitude2);
+    std::vector<double> phases2(79, 0.0);
 
+    printf("\nSynthesize the FT8 message %s at sample rate %d with time_offset %.3f into %s\n", msg1, sample_rate, offset1, wav_path);
     synthesize(
         samples.data(),
         samples.size(),
-        tones,
-        amps,
-        phases,
-        hz0,
-        offset,
+        tones_K1ABC,
+        amps1,
+        phases1,
+        hz0_1,
+        offset1,
         +1.0,
         sample_rate);
+
+    printf("\nSynthesize the FT8 message %s at sample rate %d with time_offset %.3f into %s\n", msg2, sample_rate, offset2, wav_path);
+    synthesize(
+        samples.data(),
+        samples.size(),
+        tones_IK4LZH,
+        amps2,
+        phases2,
+        hz0_2,
+        offset2,
+        +1.0,
+        sample_rate);
+
 
     // --------------------------------------------------
     // Save WAV
@@ -224,23 +231,6 @@ static void test_synthesize_ft8()
 
     printf("WAV saved: %s\n", wav_path);
 
-    // --------------------------------------------------
-    // Basic signal check
-    // --------------------------------------------------
-
-    double rms_signal = 0.0;
-
-    int off0 = std::lround(offset * sample_rate);
-
-    if (off0 >= 0 && off0 + 79 * 1920 <= nsamples)
-    {
-        rms_signal =
-            rms(samples.data() + off0, 79 * 1920);
-    }
-
-    printf("Signal RMS: %.6f\n", rms_signal);
-
-    printf("PASS\n");
 }
 
 int main()

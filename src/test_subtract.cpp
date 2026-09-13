@@ -630,7 +630,7 @@ static void test_synthesize()
 
     const size_t nsamples = 192000;
     const double offset = 0.0;
-    const double offset_error = 0.012;
+    const double offset_error = 0.01;
     const double hz0 = 1000.0;
     const double amplitude = 1000.0;
 

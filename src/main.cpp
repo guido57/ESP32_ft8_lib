@@ -155,6 +155,7 @@ static void decode_file(const char* path, float base_freq_mhz, bool is_ft8)
     ctx.is_ft8 = is_ft8;
     ctx.base_freq_mhz = base_freq_mhz;
     
+    
     unsigned long t0 = millis();
     int rc = ft8_decode_slot(signal, sample_rate, num_samples, &ctx);
     unsigned long elapsed = millis() - t0;
@@ -234,16 +235,19 @@ static float* alloc_sample_buffer(size_t count)
 
 int main(int argc, char** argv)
 {
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s <wavfile> [base_freq_mhz]\n", argv[0]);
+    if (argc < 5) {
+        fprintf(stderr, "Usage: %s <wavfile> cand_to_subtract freq_hz_subtract time_delay_subtract\n", argv[0]);
         return 2;
     }
     
     const char* wav_path = argv[1];
-    float time_delay = 0.0f;
-    if (argc >= 3) {
-        time_delay = (float)atof(argv[2]);
-    }
+    int cand_to_subtract = 0;
+    float freq_hz_subtract = 0.0f;
+    float time_delay_subtract = 0.0f;
+    cand_to_subtract = (int)atoi(argv[2]);
+    freq_hz_subtract = (float)atof(argv[3]);
+    time_delay_subtract = (float)atof(argv[4]);
+    
     
     int fd = open(wav_path, O_RDONLY);
     if (fd < 0) {
@@ -264,7 +268,9 @@ int main(int argc, char** argv)
     
     ft8_decode_context_t ctx = {0};
     ctx.is_ft8 = true;
-    ctx.time_delay = time_delay;
+    ctx.time_delay_subtract = time_delay_subtract;
+    ctx.cand_to_subtract = cand_to_subtract;
+    ctx.freq_hz_subtract = freq_hz_subtract;
     
     struct timespec t0 = {0};
     struct timespec t1 = {0};

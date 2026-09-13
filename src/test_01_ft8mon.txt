@@ -1,90 +1,29 @@
-======== PASS 1 OF 3 ==================
-
-0.016 1 184737   5 174  0.78 1369.0 CQ OK6LZ  JN99
-subtracting: hz 1368.95, off 1.285, ts 0.0000
-  target amplitude: 0.024149 -> 0.000788  suppression 29.72 dB
-0.024 2 184737  -1 162  0.79 2631.5 CQ     OR18OSB
-subtracting: hz 2631.49, off 1.295, ts 0.0000
-  target amplitude: 0.104986 -> 0.006878  suppression 23.67 dB
-0.038 3 184737  13 174  0.76  891.8 SA5QED IQ5PJ  73  
-subtracting: hz 891.77, off 1.260, ts 0.0000
-  target amplitude: 0.094125 -> 0.002626  suppression 31.09 dB
-0.047 4 184737   4 174  0.80 2326.6 CQ  R8AU  MO05
-subtracting: hz 2326.60, off 1.300, ts 0.0000
-  target amplitude: 0.022149 -> 0.001078  suppression 26.25 dB
-0.057 5 184737  -7 171  0.62  955.0 CQ IU8DMZ JN70
-subtracting: hz 955.05, off 1.120, ts 0.0000
-  target amplitude: 0.015752 -> 0.000660  suppression 27.55 dB
-0.071 6 184737   3 174  0.83 2138.1     LZ365BM <...12> 73
-subtracting: hz 2138.13, off 1.330, ts 0.0000
-  target amplitude: 0.025395 -> 0.001136  suppression 26.99 dB
-0.079 7 184737   3 174  0.83 1512.4 JO1COV DL4SBF 73  
-subtracting: hz 1512.37, off 1.330, ts 0.0000
-  target amplitude: 0.026285 -> 0.001084  suppression 27.69 dB
-0.087 8 184737  -9 163  0.80  337.9 JO1COV PE1OYB JO21
-subtracting: hz 337.88, off 1.305, ts 0.0000
-  target amplitude: 0.003450 -> 0.000158  suppression 26.77 dB
-0.099 9 184737   5 174  0.88  708.4 CQ IK4LZH JN54
-subtracting: hz 708.41, off 1.380, ts 0.0000
-  target amplitude: 0.135152 -> 0.003742  suppression 31.15 dB
-0.112 10 184737   0 174  1.04 1564.3 JI1TYA DH1NAS 73  
-subtracting: hz 1564.32, off 1.540, ts 0.0000
-  target amplitude: 0.008431 -> 0.000330  suppression 28.13 dB
-0.120 11 184737   0 174  0.84 1123.3 CQ HB9CUZ JN47
-subtracting: hz 1123.32, off 1.345, ts 0.0000
-  target amplitude: 0.144417 -> 0.006037  suppression 27.58 dB
-0.138 12 184737 -10 171  1.90  771.4 JA1FWS OK2BV  JN89
-subtracting: hz 771.44, off 2.405, ts 0.0000
-  target amplitude: 0.024918 -> 0.001219  suppression 26.21 dB
-0.161 13 184737   4 174  1.16 2278.7 PY2DPM ON6UF  RR73
-subtracting: hz 2278.70, off 1.660, ts 0.0000
-  target amplitude: 0.053510 -> 0.001298  suppression 32.31 dB
-0.169 14 184737 -13 156  1.75 1449.4 CQ RX3ASQ KO95
-subtracting: hz 1449.44, off 2.250, ts 0.0000
-  target amplitude: 0.001996 -> 0.000144  suppression 22.85 dB
-0.207 15 184737 -11 164  1.69 2389.3 CQ E75C   JN93
-subtracting: hz 2389.31, off 2.185, ts 0.0000
-  target amplitude: 0.061748 -> 0.003033  suppression 26.18 dB
-0.215 16 184737   0 174  0.90  823.4 LY2EW  DL1KDA RR73
-subtracting: hz 823.40, off 1.400, ts 0.0000
-  target amplitude: 0.027895 -> 0.001472  suppression 25.55 dB
-0.269 17 184737   0 174  1.04 1291.4 EA9ACD HA5LGO -13
-subtracting: hz 1291.36, off 1.545, ts 0.0000
-  target amplitude: 0.019972 -> 0.000835  suppression 27.58 dB
-0.512 18 184737  -5 173  0.74 2691.9 CQ OE8GMQ JN66
-subtracting: hz 2691.92, off 1.235, ts 0.0000
-  target amplitude: 0.006323 -> 0.000442  suppression 23.10 dB
-0.716 19 184737  -8 167  0.84  559.3 OE3MLC  G3ZQQ 73  
-subtracting: hz 559.30, off 1.340, ts 0.0000
-  target amplitude: 0.004436 -> 0.000196  suppression 27.10 dB
-1.009 20 184737 -14 168  0.70 1614.8 JO1COV PA0CAH JO21
-subtracting: hz 1614.83, off 1.200, ts 0.0000
-  target amplitude: 0.001832 -> 0.000119  suppression 23.76 dB
-
-======== PASS 2 OF 3 ==================
-
-1.691 21 184737  -4 170  0.96  773.0 JA1FWS HA7CH  JN97
-subtracting: hz 772.99, off 1.455, ts 0.0000
-  target amplitude: 0.016638 -> 0.000766  suppression 26.74 dB
-1.699 22 184737  -9 171  0.11 1344.8 CQ 4U1A   JN88
-subtracting: hz 1344.83, off 0.610, ts 0.0000
-  target amplitude: 0.007936 -> 0.000398  suppression 26.00 dB
-1.738 23 184737 -13 162  0.11 1284.8 MM0IMC 4U1A   -06
-subtracting: hz 1284.78, off 0.610, ts 0.0000
-  target amplitude: 0.007897 -> 0.000380  suppression 26.36 dB
-1.761 24 184737 -12 171  1.93  718.7 <...22> SQ9JJR JO90
-subtracting: hz 718.74, off 2.430, ts 0.0000
-  target amplitude: 0.009580 -> 0.000477  suppression 26.06 dB
-1.770 25 184737 -11 160  0.88 1088.4 CQ  R7NO  KN98
-subtracting: hz 1088.36, off 1.380, ts 0.0000
-  target amplitude: 0.039484 -> 0.001711  suppression 27.26 dB
-1.814 26 184737 -11 173  0.82 1157.6 CQ HA1BF  JN86
-subtracting: hz 1157.59, off 1.325, ts 0.0000
-  target amplitude: 0.027306 -> 0.000986  suppression 28.85 dB
-1.854 27 184737 -11 161  0.82 2104.0  F1BHB SP4TXI 73  
-subtracting: hz 2104.02, off 1.320, ts 0.0000
-  target amplitude: 0.004186 -> 0.000221  suppression 25.55 dB
-2.023 28 184737 -18 156  0.82  947.0 <...22> E77VM  R-11
-subtracting: hz 946.97, off 1.320, ts 0.0000
-  target amplitude: 0.004474 -> 0.000243  suppression 25.30 dB
-
+freq      SNR   time_delay    message                         pass
+337.88    -9    1.305         JO1COV PE1OYB JO21              1
+559.30    -8    1.340         OE3MLC G3ZQQ 73                 1
+708.41    +5    1.380         CQ IK4LZH JN54                  1     
+718.74   -12    2.430         <...22> SQ9JJR JO90             2     
+771.44   -10    2.405         JA1FWS OK2BV JN89               1
+772.99    -4    1.455         JA1FWS HA7CH JN97               2     
+823.40     0    1.400         LY2EW DL1KDA RR73               1
+891.77   +13    1.260         SA5QED IQ5PJ 73                 1     
+946.97   -18    1.320         <...22> E77VM R-11              2
+955.05    -7    1.120         CQ IU8DMZ JN70                  1
+1088.36  -11    1.380         CQ R7NO KN98                    2
+1123.32    0    1.345         CQ HB9CUZ JN47                  1
+1157.59  -11    1.325         CQ HA1BF JN86                   2     
+1284.78  -13    0.610         MM0IMC 4U1A -06                 2     
+1291.36    0    1.545         EA9ACD HA5LGO -13               1     
+1344.83   -9    0.610         CQ 4U1A JN88                    2     
+1368.95   +1    1.285         CQ OK6LZ JN99                   1     
+1449.44  -13    2.250         CQ RX3ASQ KO95                  1
+1512.37   +3    1.330         JO1COV DL4SBF 73                1
+1564.32    0    1.540         JI1TYA DH1NAS 73                1
+1614.83  -14    1.200         JO1COV PA0CAH JO21              1
+2104.02  -11    1.320         F1BHB SP4TXI 73                 2     
+2138.13   +3    1.330         LZ365BM <...12> 73              1
+2278.70   +4    1.660         PY2DPM ON6UF RR73               1
+2326.60   +4    1.300         CQ R8AU MO05                    1     
+2389.31  -11    2.185         CQ E75C JN93                    1
+2631.49   -1    1.295         CQ OR18OSB                      1
+2691.92   -5    1.235         CQ OE8GMQ JN66                  1

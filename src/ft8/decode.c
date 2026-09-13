@@ -353,11 +353,11 @@ int ft8_find_sync_ori(const waterfall_t* wf, int num_candidates, candidate_t hea
     // Here we allow time offsets that exceed signal boundaries, as long as we still have all data bits.
     // I.e. we can afford to skip the first 7 or the last 7 Costas symbols, as long as we track how many
     // sync symbols we included in the score, so the score is averaged.
-    for (candidate.time_sub = 0; candidate.time_sub < wf->time_osr; ++candidate.time_sub)
+    for (candidate.time_offset = 5; candidate.time_offset < 20; ++candidate.time_offset)
     {
-        for (candidate.freq_sub = 0; candidate.freq_sub < wf->freq_osr; ++candidate.freq_sub)
+        for (candidate.time_sub = 0; candidate.time_sub < wf->time_osr; ++candidate.time_sub)
         {
-            for (candidate.time_offset = 5; candidate.time_offset < 20; ++candidate.time_offset)
+            for (candidate.freq_sub = 0; candidate.freq_sub < wf->freq_osr; ++candidate.freq_sub)
             {
                 for (candidate.freq_offset = 0; (candidate.freq_offset + 7) < wf->num_bins; ++candidate.freq_offset)
                 {
@@ -368,6 +368,8 @@ int ft8_find_sync_ori(const waterfall_t* wf, int num_candidates, candidate_t hea
                     else
                     {
                         candidate.score = ft8_sync_score(wf, &candidate);
+                        // if(candidate.score >= min_score)
+                        //     printf("Candidate at time_offset=%d, time_sub=%d, freq_offset=%d, freq_sub=%d, score=%d\n", candidate.time_offset, candidate.time_sub, candidate.freq_offset, candidate.freq_sub, candidate.score);
                     }
 
                     if (candidate.score < min_score)
@@ -437,6 +439,11 @@ static void ft4_extract_likelihood(const waterfall_t* wf, const candidate_t* can
     }
 }
 
+// Get likelihoods for the 174 bits of an FT8 candidate message
+// Likelihood of a bit is a float value representing the confidence that the bit is 1
+// wf: pointer to the waterfall structure containing the frequency-time representation of the signal
+// cand: pointer to the candidate structure representing the potential FT8 message
+// log174: output array of 174 floats representing the likelihoods of each bit in the FT8 message   
 static void ft8_extract_likelihood(const waterfall_t* wf, const candidate_t* cand, float* log174)
 {
     const uint8_t* mag_cand = wf->mag + get_index(wf, cand);

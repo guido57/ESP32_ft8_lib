@@ -61,7 +61,7 @@ float refine_ft8_delay(
     float delay,
     float freq);
 
-
+    
     float refine_ft8_frequency(
     const float *samples,
     int num_samples,
@@ -77,5 +77,5 @@ float refine_ft8_delay(
     float freq_coarse);
 
 
-
+  
 #endif
