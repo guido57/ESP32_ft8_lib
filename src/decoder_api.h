@@ -14,12 +14,14 @@ typedef struct {
     float base_freq_mhz;
     struct tm utc;
     double utc_frac_sec;
-    float time_delay; // Time delay in seconds
+    int cand_to_subtract;       // Candidate to subtract
+    float freq_hz_subtract;       // Frequency in Hz to subtract
+    float time_delay_subtract; // Time delay in seconds
 } ft8_decode_context_t;
 
 // Decode a single audio slot from floating-point samples.
 // sample_rate is in Hz, base_freq_mhz is in MHz.
-int ft8_decode_slot(const float* signal, int sample_rate, int num_samples, const ft8_decode_context_t* ctx);
+int ft8_decode_slot(float* signal, int sample_rate, int num_samples, const ft8_decode_context_t* ctx);
 
 #ifdef __cplusplus
 // }

@@ -245,10 +245,14 @@ void esp_dsp_fftr(
     // nfft real samples -> nfft/2 complex samples
     // --------------------------------------------------------
 
-    dsps_fft2r_fc32_ae32_(
+    /*
+     * Select the implementation for the target.  In particular, the ESP32-S3
+     * macro resolves to the AES3 SIMD kernel; calling the AE32 symbol directly
+     * bypasses that faster implementation.
+     */
+    dsps_fft2r_fc32(
         freqdata,
-        half,
-        fft2_table
+        half
     );
 
     // --------------------------------------------------------
