@@ -46,14 +46,14 @@ int unpack_callsign(uint32_t n28, uint8_t ip, uint8_t i3, char* result)
             aaaa[4] = '\0';
             for (int i = 3; /* */; --i)
             {
-                aaaa[i] = charn(n % 27, 4);
+                aaaa[i] = charn(n % 27, FT8_CHAR_TABLE_LETTERS_SPACE);
                 if (i == 0)
                     break;
                 n /= 27;
             }
 
             strcpy(result, "CQ ");
-            strcat(result, trim_front(aaaa));
+            strcat(result, trim_front(aaaa, ' '));
             return 0; // Success
         }
         // ? TODO: unspecified in the WSJT-X code
@@ -78,17 +78,17 @@ int unpack_callsign(uint32_t n28, uint8_t ip, uint8_t i3, char* result)
 
     char callsign[7];
     callsign[6] = '\0';
-    callsign[5] = charn(n % 27, 4);
+    callsign[5] = charn(n % 27, FT8_CHAR_TABLE_LETTERS_SPACE);
     n /= 27;
-    callsign[4] = charn(n % 27, 4);
+    callsign[4] = charn(n % 27, FT8_CHAR_TABLE_LETTERS_SPACE);
     n /= 27;
-    callsign[3] = charn(n % 27, 4);
+    callsign[3] = charn(n % 27, FT8_CHAR_TABLE_LETTERS_SPACE);
     n /= 27;
-    callsign[2] = charn(n % 10, 3);
+    callsign[2] = charn(n % 10, FT8_CHAR_TABLE_NUMERIC);
     n /= 10;
-    callsign[1] = charn(n % 36, 2);
+    callsign[1] = charn(n % 36, FT8_CHAR_TABLE_ALPHANUM);
     n /= 36;
-    callsign[0] = charn(n % 37, 1);
+    callsign[0] = charn(n % 37, FT8_CHAR_TABLE_ALPHANUM_SPACE);
 
     // Skip trailing and leading whitespace in case of a short callsign
     strcpy(result, trim(callsign));
@@ -233,7 +233,7 @@ int unpack_text(const uint8_t* a71, char* text)
             b71[i] = rem / 42;
             rem = rem % 42;
         }
-        c14[idx] = charn(rem, 0);
+        c14[idx] = charn(rem, FT8_CHAR_TABLE_FULL);
     }
 
     strcpy(text, trim(c14));
@@ -295,7 +295,7 @@ int unpack_nonstandard(const uint8_t* a77, char* call_to, char* call_de, char* e
 
     for (int i = 10; /* no condition */; --i)
     {
-        c11[i] = charn(n58 % 38, 5);
+        c11[i] = charn(n58 % 38, FT8_CHAR_TABLE_ALPHANUM_SPACE_SLASH);
         if (i == 0)
             break;
         n58 /= 38;

@@ -21,6 +21,8 @@
 #else
 #include <cstdlib>   // malloc, free
 #include <cstring>   // memcmp
+#include <cerrno>
+#include <cmath>
 #include <stdio.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -233,20 +235,72 @@ static float* alloc_sample_buffer(size_t count)
     return (float*)malloc(bytes);
 }
 
+static bool set_slot_utc(const char* value, ft8_decode_context_t* ctx)
+{
+    // A clock-only value is deliberate: FT8 display lines need the UTC slot
+    // time, not a calendar date.  The date in ctx.utc is unused by the core.
+    int hour = 0;
+    int minute = 0;
+    double second = 0.0;
+    if (sscanf(value, "%d:%d:%lf", &hour, &minute, &second) != 3 ||
+        hour < 0 || hour > 23 || minute < 0 || minute > 59 ||
+        second < 0.0 || second >= 60.0) {
+        return false;
+    }
+
+    ctx->utc.tm_hour = hour;
+    ctx->utc.tm_min = minute;
+    ctx->utc.tm_sec = (int)second;
+    ctx->utc_frac_sec = second - ctx->utc.tm_sec;
+    return true;
+}
+
+static void set_current_ft8_slot_utc(ft8_decode_context_t* ctx)
+{
+    time_t now = time(NULL);
+    gmtime_r(&now, &ctx->utc);
+    ctx->utc.tm_sec = (ctx->utc.tm_sec / 15) * 15;
+    ctx->utc_frac_sec = 0.0;
+}
+
+static bool parse_int_arg(const char* value, int* out)
+{
+    char* end = NULL;
+    errno = 0;
+    const long parsed = strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' ||
+        parsed < -1 || parsed > INT32_MAX) {
+        return false;
+    }
+    *out = (int)parsed;
+    return true;
+}
+
+static bool parse_float_arg(const char* value, float minimum, float* out)
+{
+    char* end = NULL;
+    errno = 0;
+    const float parsed = strtof(value, &end);
+    if (errno != 0 || end == value || *end != '\0' ||
+        !std::isfinite(parsed) || parsed < minimum) {
+        return false;
+    }
+    *out = parsed;
+    return true;
+}
+
 int main(int argc, char** argv)
 {
-    if (argc < 5) {
-        fprintf(stderr, "Usage: %s <wavfile> cand_to_subtract freq_hz_subtract time_delay_subtract\n", argv[0]);
+    if (argc != 2 && argc != 3 && argc != 5 && argc != 6) {
+        fprintf(stderr,
+                "Usage: %s <wavfile> [UTC HH:MM:SS[.mmm]]\n"
+                "       %s <wavfile> <cand> <freq_hz> <delay_s> [UTC HH:MM:SS[.mmm]]\n"
+                "       cand=-1 disables the manual candidate/frequency/delay override.\n",
+                argv[0], argv[0]);
         return 2;
     }
     
     const char* wav_path = argv[1];
-    int cand_to_subtract = 0;
-    float freq_hz_subtract = 0.0f;
-    float time_delay_subtract = 0.0f;
-    cand_to_subtract = (int)atoi(argv[2]);
-    freq_hz_subtract = (float)atof(argv[3]);
-    time_delay_subtract = (float)atof(argv[4]);
     
     
     int fd = open(wav_path, O_RDONLY);
@@ -268,9 +322,41 @@ int main(int argc, char** argv)
     
     ft8_decode_context_t ctx = {0};
     ctx.is_ft8 = true;
-    ctx.time_delay_subtract = time_delay_subtract;
-    ctx.cand_to_subtract = cand_to_subtract;
-    ctx.freq_hz_subtract = freq_hz_subtract;
+    // Negative means normal automatic cancellation.  A non-negative value
+    // selects one waterfall candidate for an explicitly positioned subtract.
+    ctx.cand_to_subtract = -1;
+    set_current_ft8_slot_utc(&ctx);
+
+    int utc_arg = 0;
+    if (argc >= 5) {
+        if (!parse_int_arg(argv[2], &ctx.cand_to_subtract) ||
+            !parse_float_arg(argv[3], 0.0f, &ctx.freq_hz_subtract) ||
+            !parse_float_arg(argv[4], -INFINITY, &ctx.time_delay_subtract)) {
+            fprintf(stderr,
+                    "Invalid subtract arguments; cand must be -1 or >= 0, "
+                    "freq_hz must be >= 0 and delay_s must be finite\n");
+            free(signal);
+            close(fd);
+            return 2;
+        }
+        utc_arg = 5;
+    } else if (argc == 3) {
+        // Also accept a short explicit "no manual override" spelling.
+        // Any other one-argument suffix is interpreted as UTC.
+        int candidate = 0;
+        if (parse_int_arg(argv[2], &candidate) && candidate == -1) {
+            ctx.cand_to_subtract = -1;
+        } else {
+            utc_arg = 2;
+        }
+    }
+
+    if (utc_arg != 0 && !set_slot_utc(argv[utc_arg], &ctx)) {
+        fprintf(stderr, "Invalid UTC time '%s'; expected HH:MM:SS[.mmm]\n", argv[utc_arg]);
+        free(signal);
+        close(fd);
+        return 2;
+    }
     
     struct timespec t0 = {0};
     struct timespec t1 = {0};
@@ -284,8 +370,7 @@ int main(int argc, char** argv)
     free(signal);
     close(fd);
     
-    fprintf(stdout, "decode time: %ld ms\n", elapsed_ms);
-    fprintf(stdout, "process_buffer returned %d\n", rc);
+    fprintf(stderr, "decode time: %ld ms\n", elapsed_ms);
     
     return rc == 0 ? 0 : 1;
 }

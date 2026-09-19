@@ -6,7 +6,18 @@
 #include <cstdio>
 
 // int rate_ = 12000;  // samples/second
-double subtract_ramp = 0.11;
+#ifndef FT8_SUBTRACT_RAMP
+#define FT8_SUBTRACT_RAMP 0.11
+#endif
+double subtract_ramp = FT8_SUBTRACT_RAMP;
+
+#ifndef FT8_FINE_FREQ_RANGE_HZ
+#define FT8_FINE_FREQ_RANGE_HZ 1.0f
+#endif
+
+#ifndef FT8_FINE_FREQ_STEP_HZ
+#define FT8_FINE_FREQ_STEP_HZ 1.0f
+#endif
 
 extern double elapsed_ms(const struct timespec *t0, const struct timespec *t1);
 
@@ -1442,15 +1453,20 @@ void diagnose_subtraction(
 float refine_ft8_delay(
     const float* samples,
     int num_samples,
+    int sample_rate,
     const uint8_t* tones,
     float delay0,
     float freq,
     int cand_to_print)
 {
-    constexpr int sample_rate = 12000;
     constexpr int ntones = 79;
 
     const int block = blocksize(sample_rate);
+    // Match subtract(): avoid the FT8 symbol ramps and score only the
+    // steady-state central 80% of each symbol.
+    const int corr_first = block / 10;
+    const int corr_last = block - block / 10;
+    const int corr_len = corr_last - corr_first;
 
     /*
      * =========================================================
@@ -1493,8 +1509,8 @@ float refine_ft8_delay(
      * element per delay step - a purely sequential scan that
      * PSRAM/cache hardware can prefetch/burst efficiently.
      *
-     * This still touches exactly the same samples, with the same
-     * 79-tone correlation and the same +/-0.300 s window, and now
+     * This scores every one-sample delay with the same central-80% symbol
+     * region used by subtract(), and now
      * scores every single delay exactly (no sparse-scan/local
      * refine approximation needed), so accuracy is at least as
      * good as before.
@@ -1520,13 +1536,13 @@ float refine_ft8_delay(
             sinf(w);
 
         /*
-         * exp(-j*w*(block-1)), rotation applied to the incoming sample.
+         * exp(-j*w*(corr_len-1)), rotation applied to the incoming sample.
          */
         float end_c = 1.0f;
         float end_s = 0.0f;
 
         for (int n = 0;
-             n < block - 1;
+             n < corr_len - 1;
              ++n)
         {
             const float nc =
@@ -1546,14 +1562,14 @@ float refine_ft8_delay(
         float cq = 0.0f;
 
         const int start0 =
-            first_delay + k * block;
+            first_delay + k * block + corr_first;
 
         if (start0 >= 0 &&
             start0 < num_samples)
         {
             const int count =
                 std::min(
-                    block,
+                    corr_len,
                     num_samples - start0);
 
             float c = 1.0f;
@@ -1594,13 +1610,13 @@ float refine_ft8_delay(
         for (int d = 1; d < ndelays; ++d)
         {
             const int start =
-                first_delay + d + k * block;
+                first_delay + d + k * block + corr_first;
 
             if (start >= num_samples)
                 break;
 
             const int new_index =
-                start + block - 1;
+                start + corr_len - 1;
 
             if (new_index >= num_samples)
                 break;
@@ -1662,6 +1678,44 @@ float refine_ft8_delay(
 
     return best_delay /
            (float)sample_rate;
+}
+
+void refine_ft8_joint(const float *samples, int num_samples, int sample_rate,
+                      const uint8_t *tones, float delay_coarse,
+                      float freq_coarse, int cand_to_print,
+                      float *delay_out, float *freq_out)
+{
+    constexpr int ntones = 79;
+    constexpr float pi2 = 6.2831853071795864769f;
+    const int block = blocksize(sample_rate), first = block / 10, last = block - block / 10;
+    float best_score = -1.0f, best_delay = delay_coarse, best_freq = freq_coarse;
+    const int num_steps = (int)lroundf(
+        FT8_FINE_FREQ_RANGE_HZ / FT8_FINE_FREQ_STEP_HZ);
+    // Refine timing independently for each fine-frequency hypothesis.  The
+    // default is the former -1/0/+1 Hz search; native builds can widen this
+    // when residual cancellation of dense signals needs more precision.
+    for (int step = -num_steps; step <= num_steps; ++step) {
+        const float freq = freq_coarse +
+                           (float)step * FT8_FINE_FREQ_STEP_HZ;
+        const float delay = refine_ft8_delay(samples, num_samples, sample_rate, tones,
+                                             delay_coarse, freq, cand_to_print);
+        float score = 0.0f;
+        for (int k = 0; k < ntones; ++k) {
+            const int start = (int)lroundf(delay * sample_rate) + k * block + first;
+            if (start < 0 || start + (last - first) > num_samples) continue;
+            const float w = pi2 * (freq + 6.25f * tones[k]) / sample_rate;
+            const float cd = cosf(w), sd = sinf(w);
+            float c = 1.0f, s = 0.0f, re = 0.0f, im = 0.0f;
+            for (int n = first; n < last; ++n) {
+                const float x = samples[start + n - first];
+                re += x * c; im -= x * s;
+                const float nc = c * cd - s * sd; s = s * cd + c * sd; c = nc;
+            }
+            score += re * re + im * im;
+        }
+        if (score > best_score) { best_score = score; best_delay = delay; best_freq = freq; }
+    }
+    *delay_out = best_delay; *freq_out = best_freq;
 }
 
 

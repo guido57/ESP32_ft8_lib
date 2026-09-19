@@ -1,8 +1,12 @@
 #include <stdlib.h>
 #include <string.h>
+#include <inttypes.h>
 #include "ft8/text.h"
 #include "ft8/message.h"
 
+#ifdef LOG_LEVEL
+#undef LOG_LEVEL
+#endif
 #define LOG_LEVEL LOG_WARN
 #include "ft8/debug.h"
 
@@ -115,7 +119,7 @@ ftx_message_type_t ftx_message_get_type(const ftx_message_t* msg)
 
 void trim_copy(char* trimmed, const char* str)
 {
-    str = (char*)trim_front(str);
+    str = (char*)trim_front(str, ' ');
     int len = strlen(str) - 1;
     while (len >= 0 && str[len] == ' ')
     {
@@ -591,7 +595,7 @@ ftx_message_rc_t ftx_message_decode_nonstd(const ftx_message_t* msg, ftx_callsig
 
     // Extract i3 (bits 74..76)
     uint8_t i3 = (msg->payload[9] >> 3) & 0x07u;
-    LOG(LOG_DEBUG, "decode_nonstd() n12=%04x n58=%08llx iflip=%d nrpt=%d icq=%d i3=%d\r\n", n12, n58, iflip, nrpt, icq, i3);
+    LOG(LOG_DEBUG, "decode_nonstd() n12=%04x n58=%08" PRIx64 " iflip=%d nrpt=%d icq=%d i3=%d\r\n", n12, n58, iflip, nrpt, icq, i3);
 
     // Decode one of the calls from 58 bit encoded string
     char call_decoded[14];
@@ -983,7 +987,7 @@ static int unpack28(uint32_t n28, uint8_t ip, uint8_t i3, const ftx_callsign_has
             }
 
             strcpy(result, "CQ ");
-            strcat(result, trim_front(aaaa));
+            strcat(result, trim_front(aaaa, ' '));
             *field_type = FTX_FIELD_TOKEN_WITH_ARG;
             return 0; // Success
         }
@@ -1083,7 +1087,7 @@ static bool pack58(const ftx_callsign_hash_interface_t* hash_if, const char* cal
         return false;
 
     *n58 = result;
-    LOG(LOG_DEBUG, "pack58('%s')=%016llx\r\n", callsign, *n58);
+    LOG(LOG_DEBUG, "pack58('%s')=%016" PRIx64 "\r\n", callsign, *n58);
     return true;
 }
 
@@ -1103,7 +1107,7 @@ static bool unpack58(uint64_t n58, const ftx_callsign_hash_interface_t* hash_if,
     // The decoded string will be right-aligned, so trim all whitespace (also from back just in case)
     trim_copy(callsign, c11);
 
-    LOG(LOG_DEBUG, "unpack58(%016llx)=%s\r\n", n58_backup, callsign);
+    LOG(LOG_DEBUG, "unpack58(%016" PRIx64 ")=%s\r\n", n58_backup, callsign);
 
     // Save the decoded call in a hash table for later
     if (strlen(callsign) >= 3)

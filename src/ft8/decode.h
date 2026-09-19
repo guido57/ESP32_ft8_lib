@@ -61,6 +61,8 @@ extern "C"
         uint16_t crc_extracted;  ///< CRC value recovered from the message
         uint16_t crc_calculated; ///< CRC value calculated over the payload
         int unpack_status;       ///< Return value of the unpack routine
+        float codeword_metric;   ///< Normalized raw-likelihood support (0..1)
+        float osd_score;         ///< Native OSD metric; zero for normal BP decodes
     } decode_status_t;
 
     /// Localize top N candidates in frequency and time according to their sync strength (looking at Costas symbols)

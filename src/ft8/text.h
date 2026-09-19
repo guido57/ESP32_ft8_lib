@@ -11,8 +11,8 @@ extern "C"
 
     // Utility functions for characters and strings
 
-    const char* trim_front(const char* str);
-    void trim_back(char* str);
+    const char* trim_front(const char* str, char to_trim);
+    void trim_back(char* str, char to_trim);
     char* trim(char* str);
 
     char to_upper(char c);
@@ -36,10 +36,6 @@ extern "C"
     // Convert a 2 digit integer to string
     void int_to_dd(char* str, int value, int width, bool full_sign);
 
-    char charn(int c, int table_idx);
-    int nchar(char c, int table_idx);
-
-
     typedef enum
     {
         FT8_CHAR_TABLE_FULL,                 // table[42] " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-./?"
@@ -49,6 +45,9 @@ extern "C"
         FT8_CHAR_TABLE_ALPHANUM,             // table[36] "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
         FT8_CHAR_TABLE_NUMERIC,              // table[10] "0123456789"
     } ft8_char_table_e;
+
+    char charn(int c, ft8_char_table_e table);
+    int nchar(char c, ft8_char_table_e table);
 
 
 #ifdef __cplusplus

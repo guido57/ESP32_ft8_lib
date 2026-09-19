@@ -32,7 +32,7 @@
 #endif
 
 #ifndef FT8_LDPC_ITERATIONS
-#define FT8_LDPC_ITERATIONS 20
+#define FT8_LDPC_ITERATIONS 40
 #endif
 
 #ifndef FT8_MAX_DECODED_MSGS

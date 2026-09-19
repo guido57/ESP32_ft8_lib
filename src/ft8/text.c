@@ -2,21 +2,19 @@
 
 #include <string.h>
 
-const char* trim_front(const char* str)
+const char* trim_front(const char* str, char to_trim)
 {
-    // Skip leading whitespace
-    while (*str == ' ')
+    while (*str == to_trim)
     {
         str++;
     }
     return str;
 }
 
-void trim_back(char* str)
+void trim_back(char* str, char to_trim)
 {
-    // Skip trailing whitespace by replacing it with '\0' characters
     int idx = strlen(str) - 1;
-    while (idx >= 0 && str[idx] == ' ')
+    while (idx >= 0 && str[idx] == to_trim)
     {
         str[idx--] = '\0';
     }
@@ -26,8 +24,8 @@ void trim_back(char* str)
 // 2) trims a string from the front by skipping whitespaces
 char* trim(char* str)
 {
-    str = (char*)trim_front(str);
-    trim_back(str);
+    str = (char*)trim_front(str, ' ');
+    trim_back(str, ' ');
     // return a pointer to the first non-whitespace character
     return str;
 }
@@ -171,33 +169,34 @@ void int_to_dd(char* str, int value, int width, bool full_sign)
 // table 3: "0123456789"
 // table 4: " ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 // table 5: " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/"
-char charn(int c, int table_idx)
+char charn(int c, ft8_char_table_e table)
 {
-    if (table_idx != 2 && table_idx != 3)
+    if ((table != FT8_CHAR_TABLE_ALPHANUM) &&
+        (table != FT8_CHAR_TABLE_NUMERIC))
     {
         if (c == 0)
             return ' ';
         c -= 1;
     }
-    if (table_idx != 4)
+    if (table != FT8_CHAR_TABLE_LETTERS_SPACE)
     {
         if (c < 10)
             return '0' + c;
         c -= 10;
     }
-    if (table_idx != 3)
+    if (table != FT8_CHAR_TABLE_NUMERIC)
     {
         if (c < 26)
             return 'A' + c;
         c -= 26;
     }
 
-    if (table_idx == 0)
+    if (table == FT8_CHAR_TABLE_FULL)
     {
         if (c < 5)
             return "+-./?"[c];
     }
-    else if (table_idx == 5)
+    else if (table == FT8_CHAR_TABLE_ALPHANUM_SPACE_SLASH)
     {
         if (c == 0)
             return '/';
@@ -207,29 +206,30 @@ char charn(int c, int table_idx)
 }
 
 // Convert character to its index (charn in reverse) according to a table
-int nchar(char c, int table_idx)
+int nchar(char c, ft8_char_table_e table)
 {
     int n = 0;
-    if (table_idx != 2 && table_idx != 3)
+    if ((table != FT8_CHAR_TABLE_ALPHANUM) &&
+        (table != FT8_CHAR_TABLE_NUMERIC))
     {
         if (c == ' ')
             return n + 0;
         n += 1;
     }
-    if (table_idx != 4)
+    if (table != FT8_CHAR_TABLE_LETTERS_SPACE)
     {
         if (c >= '0' && c <= '9')
             return n + (c - '0');
         n += 10;
     }
-    if (table_idx != 3)
+    if (table != FT8_CHAR_TABLE_NUMERIC)
     {
         if (c >= 'A' && c <= 'Z')
             return n + (c - 'A');
         n += 26;
     }
 
-    if (table_idx == 0)
+    if (table == FT8_CHAR_TABLE_FULL)
     {
         if (c == '+')
             return n + 0;
@@ -242,7 +242,7 @@ int nchar(char c, int table_idx)
         if (c == '?')
             return n + 4;
     }
-    else if (table_idx == 5)
+    else if (table == FT8_CHAR_TABLE_ALPHANUM_SPACE_SLASH)
     {
         if (c == '/')
             return n + 0;

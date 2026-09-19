@@ -10,10 +10,17 @@
 #include <stdio.h>
 #include <errno.h>
 #include <stdint.h>
-#ifdef __linux
-#include <bsd/stdlib.h>
-#endif
 #include <sys/file.h>
+
+// BSD reallocf() frees the original allocation if resizing fails.  Keep that
+// behavior locally so native builds need no libbsd development package.
+static void* wave_reallocf(void* ptr, size_t size)
+{
+  void* resized = realloc(ptr, size);
+  if (resized == NULL && size != 0)
+    free(ptr);
+  return resized;
+}
 
 
 // Save signal in floating point format (-1 .. +1) as a WAVE file using 16-bit signed integers.
@@ -186,7 +193,7 @@ int load_wav(float **signal, int* num_frames, int *num_channels, int* sample_rat
 	  }
 	  if(count != *num_frames * numChannels){
 	    // Trim buffer and return the actual count
-	    *signal = reallocf(*signal,sizeof(float) * count);
+            *signal = wave_reallocf(*signal,sizeof(float) * count);
 	    *num_frames = count / numChannels;
 	  }
 	}
@@ -204,7 +211,7 @@ int load_wav(float **signal, int* num_frames, int *num_channels, int* sample_rat
 	  int const count = fread(*signal,blockAlign,*num_frames, f); // Read floating point directly
 	  if(count != *num_frames){
 	    // Trim buffer and return the actual count
-	    *signal = reallocf(*signal,blockAlign * count);
+            *signal = wave_reallocf(*signal,blockAlign * count);
 	    *num_frames = count;
 	  }
 	}

@@ -4,7 +4,12 @@
 #include "ldpc.h"
 #include "unpack.h"
 
+#if defined(NATIVE_BUILD)
+#include "native_osd.h"
+#endif
+
 #include <stdbool.h>
+#include <alloca.h>
 #include <math.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -28,11 +33,13 @@ static float max2(float a, float b);
 static float max4(float a, float b, float c, float d);
 static void heapify_down(candidate_t heap[], int heap_size);
 static void heapify_up(candidate_t heap[], int heap_size);
+int ft8_find_sync_ori(const waterfall_t* wf, int num_candidates, candidate_t heap[], int min_score);
 
 static void ftx_normalize_logl(float* log174);
 static void ft4_extract_symbol(const uint8_t* wf, float* logl);
 static void ft8_extract_symbol(const uint8_t* wf, float* logl);
 static void ft8_decode_multi_symbols(const uint8_t* wf, int num_bins, int n_syms, int bit_idx, float* log174);
+
 
 static int get_index(const waterfall_t* wf, const candidate_t* candidate)
 {
@@ -219,6 +226,12 @@ static inline __attribute__((always_inline)) int ft8_sync_score_optimized(const 
 // Versione definitiva consolidata al massimo delle performance stabili
 __attribute__((section(".iram1.text"))) int ft8_find_sync(const waterfall_t* wf, int num_candidates, candidate_t heap[], int min_score)
 {
+#if defined(FT8_REFERENCE_SYNC)
+    // Keep this selectable for cross-target validation.  The reference scan
+    // scores every candidate through ft8_sync_score(), avoiding assumptions
+    // made by the batched implementation below.
+    return ft8_find_sync_ori(wf, num_candidates, heap, min_score);
+#else
     int heap_size = 0;
     candidate_t candidate;
     const bool is_ft4 = (wf->protocol == PROTO_FT4);
@@ -342,6 +355,7 @@ __attribute__((section(".iram1.text"))) int ft8_find_sync(const waterfall_t* wf,
         heapify_down(heap, len_unsorted);
     }
     return heap_size;
+#endif
 }
 
 
@@ -514,6 +528,42 @@ bool ft8_decode(const waterfall_t* wf, const candidate_t* cand, message_t* messa
     uint8_t plain174[FTX_LDPC_N]; // message bits (0/1)
     // printf("Decoding LDPC with max_iterations=%d\n", max_iterations);
     bp_decode(log174, max_iterations, plain174, &status->ldpc_errors);
+
+    // Measure support from the channel likelihoods, not the BP messages.
+    // A parity-valid but unrelated LDPC attractor normally has much weaker
+    // agreement with the original 174 soft decisions than a transmitted word.
+    float metric_sum = 0.0f;
+    float metric_abs = 0.0f;
+    for (int i = 0; i < FTX_LDPC_N; ++i)
+    {
+        metric_sum += plain174[i] ? log174[i] : -log174[i];
+        metric_abs += fabsf(log174[i]);
+    }
+    status->codeword_metric = (metric_abs > 0.0f) ?
+        metric_sum / metric_abs : 0.0f;
+
+#if defined(NATIVE_BUILD) && !defined(FT8_NATIVE_OSD)
+#define FT8_NATIVE_OSD 0
+#endif
+#ifndef FT8_NATIVE_OSD_MIN_METRIC
+#define FT8_NATIVE_OSD_MIN_METRIC 0.0f
+#endif
+#if defined(NATIVE_BUILD) && FT8_NATIVE_OSD
+    float osd_score = 0.0f;
+    if ((wf->protocol == PROTO_FT8) &&
+        (status->ldpc_errors > 0) &&
+        (status->ldpc_errors <= 12) &&
+        native_osd_recover(log174, plain174, &osd_score) &&
+        (osd_score >= FT8_NATIVE_OSD_MIN_METRIC))
+    {
+        status->osd_score = osd_score;
+#if defined(NATIVE_DIAGNOSTIC)
+        fprintf(stderr, "OSD recovered: parity_errors=%d metric=%.3f\n", status->ldpc_errors, osd_score);
+#endif
+        status->ldpc_errors = 0;
+    }
+#endif
+
     if (plain != NULL)
         {
             for (int i = 0; i < FTX_LDPC_N; ++i)
@@ -561,7 +611,9 @@ bool ft8_decode(const waterfall_t* wf, const candidate_t* cand, message_t* messa
     // printf("Unpacking 77 bits from byte array\n");
     status->unpack_status = unpack77(a91, message->text);
 
-    if (status->unpack_status < 0)
+    // A syntactically empty payload is not a displayable FT8 message.  In
+    // particular, reject it before reporting native list-decoder candidates.
+    if ((status->unpack_status < 0) || (message->text[0] == '\0'))
     {
         return false;
     }

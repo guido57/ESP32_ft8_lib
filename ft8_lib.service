@@ -1,0 +1,21 @@
+[Unit]
+Description=FT8 WebSocket receiver and decoder
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/ft8_lib
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /home/pi/ft8_lib/jt9_ws.py
+Restart=always
+RestartSec=5
+
+# Send Python output to the systemd journal (view with journalctl -u ft8_lib).
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

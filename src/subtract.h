@@ -9,6 +9,8 @@
 int
 blocksize(int rate);
 
+extern double subtract_ramp;
+
 void synthesize(
     float *dst,
     size_t nsamples,
@@ -41,6 +43,7 @@ void diagnose_subtraction(
 float refine_ft8_delay(
     const float* samples,
     int num_samples,
+    int sample_rate,
     const uint8_t* tones,
     float delay0,
     float freq,
@@ -68,6 +71,12 @@ float refine_ft8_delay(
     const uint8_t *tones,
     float delay,
     float freq_coarse);
+
+    void refine_ft8_joint(
+    const float *samples, int num_samples, int sample_rate,
+    const uint8_t *tones,
+    float delay_coarse, float freq_coarse, int cand_to_print,
+    float *delay_out, float *freq_out);
 
     float refine_ft8_frequency_costas(
     const float *samples,

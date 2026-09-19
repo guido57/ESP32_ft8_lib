@@ -24,6 +24,7 @@
                 "PLATFORMIO=60200",
                 "NATIVE_BUILD",
                 "LOG_LEVEL=LOG_INFO",
+                "NATIVE_DIAGNOSTIC=1",
                 "__PLATFORMIO_BUILD_DEBUG__",
                 ""
             ],

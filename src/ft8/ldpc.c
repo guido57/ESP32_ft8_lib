@@ -163,7 +163,6 @@ void bp_decode(float codeword[], int max_iters, uint8_t plain[], int* ok)
         {
             // we have a better guess - update the result
             min_errors = errors;
-
             if (errors == 0)
             {
                 break; // Found a perfect answer

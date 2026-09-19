@@ -39,10 +39,57 @@ pio run --environment native
 Run:
 
 ```bash
-./.pio/build/native/program tests/CQIW5ALZ.wav 14.074
+./.pio/build/native/program tests/CQIW5ALZ.wav 09:56:30
 ```
 
-The output includes decoded messages plus decode execution time.
+The optional time is the UTC start of the captured FT8 slot. The decoder prints
+a frequency-sorted FT8 decode block to standard output; execution time is sent
+to standard error.
+
+### Raspberry Pi 5 (64-bit Raspberry Pi OS)
+
+Install the native build prerequisites once:
+
+```bash
+sudo apt update
+sudo apt install build-essential
+```
+
+Build directly with the Pi's local GCC/G++ toolchain (no PlatformIO required):
+
+```bash
+make
+./ft8_decoder tests/CQIW5ALZ.wav 09:56:30
+```
+
+This produces an ARM64 executable when run on 64-bit Raspberry Pi OS. The
+`native_rpi5` PlatformIO environment remains available as an alternative.
+
+For the verbose native diagnostics used on Ubuntu (pass 0/pass 1 banners,
+waterfall statistics, and candidate details), use the PlatformIO `native`
+environment or build with Make directly:
+
+```bash
+make clean
+make DIAGNOSTIC=1 LOG_LEVEL=LOG_INFO
+```
+
+### Start the receiver automatically on Raspberry Pi OS
+
+The included `ft8_lib.service` starts `jt9_ws.py` after the network is ready,
+restarts it after a failure, and runs it from `/home/pi/ft8_lib`.
+
+```bash
+sudo cp ft8_lib.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now ft8_lib.service
+```
+
+Check its live output with:
+
+```bash
+journalctl -u ft8_lib.service -f
+```
 
 ### ESP32-S3 (Arduino)
 

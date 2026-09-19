@@ -1,0 +1,7 @@
+{
+  "name": "ESP32_ft8_lib",
+  "version": "0.1.0",
+  "build": {
+    "srcFilter": "+<*> -<main.cpp> -<test_*.cpp> -<gen_ft8_wav.cpp> -<subtract_actual.cpp>"
+  }
+}

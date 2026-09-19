@@ -15,15 +15,67 @@
 #include "ft8/constants.h"
 #include "ft8/ft8_config.h"
 #include "subtract.h"
-#include "ddc_ft8.h"
 
 #include "common/wave.h"
 #include "common/debug.h"
+
+extern "C" __attribute__((weak)) void ft8_on_message_decoded(
+    const char* phase,
+    const struct tm* utc,
+    double tbase_sec,
+    float base_freq_mhz,
+    const message_t* msg)
+{
+  (void)phase;
+  (void)utc;
+  (void)tbase_sec;
+  (void)base_freq_mhz;
+  (void)msg;
+}
+
+extern "C" __attribute__((weak)) void ft8_on_decode_cycle_complete()
+{
+}
+
+// Early pass 0 and full residual pass 1 are separate decoder calls. Keep
+// callback delivery unique across both calls for the same UTC slot.
+static struct tm s_callback_slot = {};
+static bool s_callback_slot_valid = false;
+static char s_callback_messages[FT8_MAX_DECODED_MSGS][25] = {};
+static int s_callback_message_count = 0;
+
+static bool should_emit_decoded_callback(const struct tm* slot,
+                                         const char* text)
+{
+  const bool same_slot = s_callback_slot_valid &&
+      s_callback_slot.tm_year == slot->tm_year &&
+      s_callback_slot.tm_yday == slot->tm_yday &&
+      s_callback_slot.tm_hour == slot->tm_hour &&
+      s_callback_slot.tm_min == slot->tm_min &&
+      s_callback_slot.tm_sec == slot->tm_sec;
+  if (!same_slot) {
+    s_callback_slot = *slot;
+    s_callback_slot_valid = true;
+    s_callback_message_count = 0;
+  }
+
+  for (int i = 0; i < s_callback_message_count; ++i) {
+    if (strcmp(s_callback_messages[i], text) == 0)
+      return false;
+  }
+  if (s_callback_message_count < FT8_MAX_DECODED_MSGS) {
+    strncpy(s_callback_messages[s_callback_message_count], text,
+            sizeof(s_callback_messages[s_callback_message_count]) - 1);
+    s_callback_messages[s_callback_message_count]
+                       [sizeof(s_callback_messages[0]) - 1] = '\0';
+    ++s_callback_message_count;
+  }
+  return true;
+}
 #include "fft/kiss_fftr.h"
 #include "fft/kiss_fft.h"
 #if defined(ARDUINO_ARCH_ESP32)
 #include <esp_heap_caps.h>
-#include "fft/esp-dsp.h"
 #else
 #define heap_caps_malloc(size, caps) malloc(size)   
 #define heap_caps_free(ptr) free(ptr)
@@ -38,10 +90,13 @@ extern "C" void pack_bits(const uint8_t bit_array[], int num_bits, uint8_t packe
 extern "C" void ft8_encode(const uint8_t* payload, uint8_t* tones);
 extern "C" void kiss_fftr(const kiss_fftr_cfg cfg, const kiss_fft_scalar *timedata, kiss_fft_cpx *freqdata);    
 
-
 const int kMin_score = FT8_MIN_SCORE; // Minimum sync score threshold for candidates
 const int kMax_candidates = FT8_MAX_CANDIDATES; // for 12 kHz sample rate; scaled for other sample rates
 const int kLDPC_iterations = FT8_LDPC_ITERATIONS;
+
+#ifndef FT8_DECODE_PASSES
+#define FT8_DECODE_PASSES 3
+#endif
 
 // This used to be 50. We're now looking at some wider bandwidths *and* FT8 is pretty popular
 // Making this bigger seems to only cost memory, which I now allocate from the heap, so what the hell
@@ -95,7 +150,7 @@ void waterfall_init(waterfall_t* me, int max_blocks, int num_bins, int time_osr,
     me->freq_osr = freq_osr;
     me->block_stride = (time_osr * freq_osr * num_bins);
     me->mag = (uint8_t  *)malloc(mag_size);
-    LOG(LOG_DEBUG, "Waterfall size = %zu\n", mag_size);
+    LOG(LOG_DEBUG, "[ft8] waterfall storage=%zu bytes\n", mag_size);
 }
 
 void waterfall_free(waterfall_t* me)
@@ -133,9 +188,6 @@ typedef struct
     // KISS FFT housekeeping variables
     void* fft_work;        ///< Work area required by Kiss FFT
     kiss_fftr_cfg fft_cfg; ///< Kiss FFT housekeeping object
-#if defined ARDUINO_ARCH_ESP32
-    bool esp_dsp_fft_ready; ///< ESP-DSP tables were allocated successfully
-#endif
 } monitor_t;
 
 // Iinitialize a monitor_t structure based on the provided configuration (monitor_config_t). 
@@ -175,14 +227,14 @@ void monitor_init(monitor_t* me, const monitor_config_t* cfg, int num_samples)
     me->fft_norm = 2.0f / me->nfft;
 
     LOG(LOG_INFO,
-        "Monitor: sample_rate=%d num_samples=%d time_osr=%d freq_osr=%d\n",
+        "[ft8] monitor sample_rate=%d samples=%d time_osr=%d freq_osr=%d\n",
         cfg->sample_rate,
         num_samples,
         cfg->time_osr,
         cfg->freq_osr);
 
     LOG(LOG_INFO,
-        "Block size = %d samples (%.3f ms) Subblock size = %d samples (%.3f ms) N_FFT = %d samples (%.3f ms)\n",
+        "[ft8] monitor block=%d (%.3fms) subblock=%d (%.3fms) fft=%d (%.3fms)\n",
         me->block_size,
         1000.0f * symbol_period,
         me->subblock_size,
@@ -217,7 +269,14 @@ void monitor_init(monitor_t* me, const monitor_config_t* cfg, int num_samples)
     if (!me->window || !me->last_frame ||
         !me->timedata || !me->freqdata)
     {
-        LOG(LOG_ERROR, "monitor_init: FFT buffer allocation failed\n");
+#if defined(ARDUINO_ARCH_ESP32)
+        LOG(LOG_ERROR,
+            "[ft8] monitor FFT buffers unavailable internal_free=%u largest=%u\n",
+            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+#else
+        LOG(LOG_ERROR, "[ft8] monitor FFT buffer allocation failed\n");
+#endif
         return;
     }
 
@@ -251,7 +310,7 @@ void monitor_init(monitor_t* me, const monitor_config_t* cfg, int num_samples)
         &fft_work_size);
 
     LOG(LOG_DEBUG,
-        "FFT work area = %zu bytes\n",
+        "[ft8] monitor FFT workspace=%zu bytes\n",
         fft_work_size);
 
     me->fft_work =
@@ -261,8 +320,16 @@ void monitor_init(monitor_t* me, const monitor_config_t* cfg, int num_samples)
 
     if (!me->fft_work)
     {
+#if defined(ARDUINO_ARCH_ESP32)
         LOG(LOG_ERROR,
-            "monitor_init: FFT work allocation failed\n");
+            "[ft8] monitor FFT workspace unavailable need=%zu internal_free=%u largest=%u\n",
+            fft_work_size,
+            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+#else
+        LOG(LOG_ERROR,
+            "[ft8] monitor FFT workspace allocation failed\n");
+#endif
         return;
     }
 
@@ -272,14 +339,6 @@ void monitor_init(monitor_t* me, const monitor_config_t* cfg, int num_samples)
             0,
             me->fft_work,
             &fft_work_size);
-
-#if defined ARDUINO_ARCH_ESP32
-    me->esp_dsp_fft_ready = esp_dsp_fftr_init();
-    if (me->esp_dsp_fft_ready)
-        LOG(LOG_INFO, "monitor_init: using ESP-DSP FFT\n");
-    else
-        LOG(LOG_WARN, "monitor_init: ESP-DSP FFT unavailable; using KISS FFT\n");
-#endif
 
     /*
      * One waterfall block corresponds to one FT8 symbol period.
@@ -304,55 +363,6 @@ void monitor_init(monitor_t* me, const monitor_config_t* cfg, int num_samples)
 
 }
 
-void monitor_init_ori(monitor_t* me, const monitor_config_t* cfg)
-{
-    float slot_time = (cfg->protocol == PROTO_FT4) ? FT4_SLOT_TIME : FT8_SLOT_TIME;
-    float symbol_period = (cfg->protocol == PROTO_FT4) ? FT4_SYMBOL_PERIOD : FT8_SYMBOL_PERIOD;
-    // Compute DSP parameters that depend on the sample rate
-    me->block_size = (int)(cfg->sample_rate * symbol_period); // samples corresponding to one FSK symbol
-    me->subblock_size = me->block_size / cfg->time_osr;
-    me->nfft = me->block_size * cfg->freq_osr;
-    me->fft_norm = 2.0f / me->nfft;
-    // const int len_window = 1.8f * me->block_size; // hand-picked and optimized
-
-    me->window = (float *)malloc(me->nfft * sizeof(me->window[0]));
-    for (int i = 0; i < me->nfft; ++i)
-    {
-        // window[i] = 1;
-        me->window[i] = hann_i(i, me->nfft);
-        // me->window[i] = blackman_i(i, me->nfft);
-        // me->window[i] = hamming_i(i, me->nfft);
-        // me->window[i] = (i < len_window) ? hann_i(i, len_window) : 0;
-    }
-    me->last_frame = (float *)malloc(me->nfft * sizeof(me->last_frame[0]));
-    me->timedata = (kiss_fft_scalar*)malloc(me->nfft * sizeof(me->timedata[0]));
-    me->freqdata = (kiss_fft_cpx*)malloc((me->nfft / 2 + 1) * sizeof(me->freqdata[0]));
-
-    size_t fft_work_size;
-    kiss_fftr_alloc(me->nfft, 0, 0, &fft_work_size);
-
-    LOG(LOG_INFO, "Block size = %d\n", me->block_size);
-    LOG(LOG_INFO, "Subblock size = %d\n", me->subblock_size);
-    LOG(LOG_INFO, "N_FFT = %d\n", me->nfft);
-    LOG(LOG_DEBUG, "FFT work area = %zu\n", fft_work_size);
-
-    me->fft_work = malloc(fft_work_size);
-    LOG(LOG_DEBUG, "init FFT for %d points work area allocated at %p\n", me->nfft, me->fft_work);
-    me->fft_cfg = kiss_fftr_alloc(me->nfft, 0, me->fft_work, &fft_work_size);
-
-    #if defined ARDUINO_ARCH_ESP32
-    dsps_fft2r_init_fc32(NULL, 2048); // Configura per 2048 punti
-    #endif
-
-    const int max_blocks = (int)(slot_time / symbol_period);
-    const int num_bins = (int)(cfg->sample_rate * symbol_period / 2);
-    waterfall_init(&me->wf, max_blocks, num_bins, cfg->time_osr, cfg->freq_osr);
-    me->wf.protocol = cfg->protocol;
-    me->symbol_period = symbol_period;
-
-    me->max_mag = -120.0f;
-}
-
 void monitor_free(monitor_t* me)
 {
     waterfall_free(&me->wf);
@@ -367,6 +377,57 @@ void monitor_free(monitor_t* me)
 
     heap_caps_free(me->window);
 }
+
+#if defined(ARDUINO_ARCH_ESP32)
+// The embedded receiver has one finalizer task. Keep its relatively large
+// FFT/waterfall workspace for the lifetime of the application instead of
+// allocating and freeing it every 15 seconds. Repeated large internal-DRAM
+// allocations eventually fail when the rest of the application fragments the
+// heap, even though the total free heap still looks adequate.
+static monitor_t s_embedded_monitor = {};
+static monitor_config_t s_embedded_monitor_cfg = {};
+static bool s_embedded_monitor_ready = false;
+
+static bool same_monitor_config(const monitor_config_t* lhs,
+                                const monitor_config_t* rhs)
+{
+    return lhs->f_min == rhs->f_min && lhs->f_max == rhs->f_max &&
+           lhs->sample_rate == rhs->sample_rate &&
+           lhs->time_osr == rhs->time_osr &&
+           lhs->freq_osr == rhs->freq_osr &&
+           lhs->protocol == rhs->protocol;
+}
+
+static monitor_t* acquire_embedded_monitor(const monitor_config_t* cfg,
+                                           int num_samples)
+{
+    if (s_embedded_monitor_ready &&
+        same_monitor_config(&s_embedded_monitor_cfg, cfg))
+        return &s_embedded_monitor;
+
+    if (s_embedded_monitor_ready) {
+        monitor_free(&s_embedded_monitor);
+        memset(&s_embedded_monitor, 0, sizeof(s_embedded_monitor));
+        s_embedded_monitor_ready = false;
+    }
+
+    monitor_init(&s_embedded_monitor, cfg, num_samples);
+    if (s_embedded_monitor.fft_cfg == NULL ||
+        s_embedded_monitor.wf.mag == NULL) {
+        monitor_free(&s_embedded_monitor);
+        memset(&s_embedded_monitor, 0, sizeof(s_embedded_monitor));
+        return NULL;
+    }
+
+    s_embedded_monitor_cfg = *cfg;
+    s_embedded_monitor_ready = true;
+    LOG(LOG_INFO,
+        "[ft8] monitor workspace ready internal_free=%u largest=%u\n",
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    return &s_embedded_monitor;
+}
+#endif
 
 // Funzione helper veloce per approssimare (2 * 10 * log10f(x) + 240) usando i cicli di clock hardware.
 // Evita del tutto la pesantissima funzione log10f() software.
@@ -506,11 +567,23 @@ void monitor_process(monitor_t* me, const float* frame)
 
         /*
          * Window and normalize.
+         *
+         * Native high-resolution mode deliberately keeps the analysis window
+         * to one FT8 symbol and zero-pads it to the requested FFT length.
+         * Frequency oversampling then interpolates the spectrum without
+         * mixing several different FSK symbols into one FFT.
          */
+#if defined(NATIVE_BUILD) && defined(FT8_NATIVE_SYMBOL_WINDOW)
+        memset(timedata, 0, nfft * sizeof(*timedata));
+        const float *const symbol = last_frame + nfft - block_size;
+        for (int i = 0; i < block_size; ++i)
+            timedata[i] = me->fft_norm * hann_i(i, block_size) * symbol[i];
+#else
         for (int i = 0; i < nfft; ++i)
         {
             timedata[i] = window[i] * last_frame[i];
         }
+#endif
 
         clock_gettime(CLOCK_MONOTONIC, &t_input);
 
@@ -617,7 +690,9 @@ void monitor_process(monitor_t* me, const float* frame)
 void monitor_reset(monitor_t* me)
 {
     me->wf.num_blocks = 0;
-    me->max_mag = 0;
+    me->max_mag = -120.0f;
+    if (me->last_frame != NULL)
+        memset(me->last_frame, 0, me->nfft * sizeof(*me->last_frame));
 }
 
 // Used to sort messages by ascending frequency, and to push empty entries to end
@@ -636,6 +711,19 @@ int mcompare(void const *a, void const *b){
   else if(ma->freq_hz < mb->freq_hz)
     return -1;
   return 0;
+}
+
+static int decode_clock_seconds(const struct tm* slot_utc, float time_sec)
+{
+  // A candidate's time is measured from the start of the FT8/FT4 slot.
+  // Work directly in UTC clock seconds so the host's local time zone cannot
+  // alter the displayed value.
+  int clock_seconds = slot_utc->tm_hour * 3600 + slot_utc->tm_min * 60 +
+                      slot_utc->tm_sec + (int)lroundf(time_sec);
+  clock_seconds %= 24 * 3600;
+  if (clock_seconds < 0)
+    clock_seconds += 24 * 3600;
+  return clock_seconds;
 }
 
 static float mag_u8_to_power(uint8_t mag)
@@ -773,288 +861,23 @@ float rms(const float *samples, size_t num_samples)
     return sqrtf(sum2 / (float)num_samples);
 }
 
-/*
- * ft8_decode() only needs 79 time rows of eight tone magnitudes.  Build that
- * minimal waterfall directly from an already-subtracted 250-Hz IQ stream so
- * a residual signal is not re-contaminated by the original wideband
- * waterfall.  The candidate is fine-synchronized first, then every local
- * waterfall bin is one exact 32-sample (160-ms) complex DFT.
- */
-static bool decode_ddc_residual_candidate_200(
-    const std::vector<IQ>& iq,
-    int iq_first_input,
-    const CostasCandidate& candidate,
-    float ddc_lo_hz,
-    message_t* message,
-    decode_status_t* status,
-    uint8_t* plain174,
-    float* refined_delay_s,
-    float* refined_freq_hz)
-{
-    constexpr int ddc_sample_rate = 250;
-    constexpr int ddc_symbol_samples = 40;
-    constexpr int ft8_symbols = 79;
-    constexpr int ft8_tones = 8;
-    constexpr float tone_spacing_hz = 6.25f;
-
-    const float iq_start_s =
-        (float)iq_first_input / 12000.0f;
-    const CostasCandidate refined = refine_costas_candidate_200(
-        iq, iq_first_input, ddc_lo_hz, candidate);
-    const int start = (int)lroundf(
-        (refined.delay_s - iq_start_s) * ddc_sample_rate);
-    if (start < 0 || start >= (int)iq.size())
-        return false;
-
-    const int available_symbols = std::min(
-        ft8_symbols,
-        ((int)iq.size() - start) / ddc_symbol_samples);
-    // All three Costas blocks must be present; a clipped data tail is okay.
-    if (available_symbols < 75)
-        return false;
-
-    const float fine_freq = refined.freq_hz;
-    const float fine_delay = refined.delay_s;
-
-    uint8_t magnitudes[ft8_symbols * ft8_tones] = {};
-    for (int symbol = 0; symbol < available_symbols; ++symbol)
-    {
-        for (int tone = 0; tone < ft8_tones; ++tone)
-        {
-            const float freq = (fine_freq - ddc_lo_hz) +
-                tone_spacing_hz * (float)tone;
-            const float phase_step =
-                -2.0f * (float)M_PI * freq /
-                (float)ddc_sample_rate;
-            const float step_c = cosf(phase_step);
-            const float step_s = sinf(phase_step);
-            float c = 1.0f;
-            float s = 0.0f;
-            float re = 0.0f;
-            float im = 0.0f;
-
-            const int first = start + symbol * ddc_symbol_samples;
-            for (int sample = 0; sample < ddc_symbol_samples; ++sample)
-            {
-                const IQ z = iq[first + sample];
-                re += z.i * c - z.q * s;
-                im += z.i * s + z.q * c;
-
-                const float next_c = c * step_c - s * step_s;
-                s = s * step_c + c * step_s;
-                c = next_c;
-            }
-
-            const float power = re * re + im * im;
-            int scaled = (int)(20.0f * log10f(1e-12f + power) + 240.0f);
-            if (scaled < 0)
-                scaled = 0;
-            else if (scaled > 255)
-                scaled = 255;
-            magnitudes[symbol * ft8_tones + tone] = (uint8_t)scaled;
-        }
-    }
-
-    waterfall_t residual_wf = {
-        .max_blocks = ft8_symbols,
-        .num_blocks = available_symbols,
-        .num_bins = ft8_tones,
-        .time_osr = 1,
-        .freq_osr = 1,
-        .mag = magnitudes,
-        .block_stride = ft8_tones,
-        .protocol = PROTO_FT8};
-    candidate_t residual_cand = {
-        .score = 0,
-        .time_offset = 0,
-        .freq_offset = 0,
-        .time_sub = 0,
-        .freq_sub = 0};
-
-    if (refined_delay_s)
-        *refined_delay_s = fine_delay;
-    if (refined_freq_hz)
-        *refined_freq_hz = fine_freq;
-    return ft8_decode(&residual_wf,
-                      &residual_cand,
-                      message,
-                      kLDPC_iterations,
-                      status,
-                      plain174);
-}
-
-// Estimate residual-message SINR without changing the active SIC stream.
-// Measure the coherently integrated power in each decoded FT8 tone and use
-// unoccupied 6.25-Hz bins as a robust, local noise estimate.  This avoids the
-// old model/residual RMS ratio, which counted every other signal in the DDC
-// passband as noise and made the result depend strongly on cancellation order.
-static bool estimate_ddc_snr_2500(
-    const std::vector<IQ>& iq,
-    int iq_first_input,
-    const uint8_t plain174[FTX_LDPC_N],
-    float delay_s,
-    float freq_hz,
-    float ddc_lo_hz,
-    float* snr_2500_db)
-{
-    constexpr int ddc_sample_rate = 250;
-    constexpr int ddc_symbol_samples = 40;
-    constexpr int ft8_symbols = 79;
-    constexpr float tone_spacing_hz = 6.25f;
-    constexpr float reference_bandwidth_hz = 2500.0f;
-
-    uint8_t tones[79];
-    get_ft8_tones_from_plain174(plain174, tones);
-
-    const float iq_start_s = (float)iq_first_input / 12000.0f;
-    const int start = (int)lroundf(
-        (delay_s - iq_start_s) * (float)ddc_sample_rate);
-    if (start < 0 || start >= (int)iq.size())
-        return false;
-
-    const int available_symbols = std::min(
-        ft8_symbols,
-        ((int)iq.size() - start) / ddc_symbol_samples);
-    if (available_symbols < 75)
-        return false;
-
-    // Complex samples repeat every Fs in frequency.  Folding here affects
-    // only this measurement and keeps aliased DDC coordinates equivalent.
-    const float relative_tone0_hz =
-        remainderf(freq_hz - ddc_lo_hz, (float)ddc_sample_rate);
-
-    auto bin_power = [&](int first, float bin_hz) {
-        const float phase_step =
-            -2.0f * (float)M_PI * bin_hz / (float)ddc_sample_rate;
-        const float step_c = cosf(phase_step);
-        const float step_s = sinf(phase_step);
-        float c = 1.0f;
-        float s = 0.0f;
-        float re = 0.0f;
-        float im = 0.0f;
-        for (int sample = 0; sample < ddc_symbol_samples; ++sample)
-        {
-            const IQ z = iq[first + sample];
-            re += z.i * c - z.q * s;
-            im += z.i * s + z.q * c;
-            const float next_c = c * step_c - s * step_s;
-            s = s * step_c + c * step_s;
-            c = next_c;
-        }
-        return re * re + im * im;
-    };
-
-    std::vector<float> signal_powers;
-    std::vector<float> noise_powers;
-    signal_powers.reserve(available_symbols);
-    noise_powers.reserve(available_symbols * 16);
-
-    for (int symbol = 0; symbol < available_symbols; ++symbol)
-    {
-        const int first = start + symbol * ddc_symbol_samples;
-        const float signal_hz = relative_tone0_hz +
-            tone_spacing_hz * (float)tones[symbol];
-        signal_powers.push_back(bin_power(first, signal_hz));
-
-        // Bins 0..7 can contain this FT8 transmission.  Sample bins on both
-        // sides, staying away from the transition region of the 80-Hz LPF.
-        for (int bin = -12; bin <= 19; ++bin)
-        {
-            if (bin >= 0 && bin <= 7)
-                continue;
-            const float noise_hz = relative_tone0_hz +
-                tone_spacing_hz * (float)bin;
-            if (fabsf(noise_hz) > 70.0f)
-                continue;
-            noise_powers.push_back(bin_power(first, noise_hz));
-        }
-    }
-
-    if (signal_powers.empty() || noise_powers.empty())
-        return false;
-
-    auto median = [](std::vector<float>& values) {
-        const size_t middle = values.size() / 2;
-        std::nth_element(values.begin(), values.begin() + middle, values.end());
-        return values[middle];
-    };
-    const float measured_tone_power = median(signal_powers);
-    // For complex Gaussian noise, FFT-bin power is exponential and its
-    // median is ln(2) times its mean.  Correct the robust median back to the
-    // mean power required by the SNR definition.
-    const float noise_bin_power = median(noise_powers) / logf(2.0f);
-    const float net_signal_power = measured_tone_power - noise_bin_power;
-    if (noise_bin_power <= 0.0f || net_signal_power <= 0.0f)
-        return false;
-
-    const float snr_bin_db =
-        10.0f * log10f(net_signal_power / noise_bin_power);
-    *snr_2500_db = snr_bin_db -
-        10.0f * log10f(reference_bandwidth_hz / tone_spacing_hz);
-    return std::isfinite(*snr_2500_db);
-}
-
-/* The Costas peak is occasionally displaced by residual energy.  Do a small
- * decode-directed search for the strongest hypothesis only; this is much
- * cheaper than applying an LDPC grid to every blind candidate. */
-static bool retry_ddc_residual_candidate_200(
-    const std::vector<IQ>& iq,
-    int iq_first_input,
-    const CostasCandidate& candidate,
-    float ddc_lo_hz,
-    message_t* message,
-    decode_status_t* status,
-    uint8_t* plain174,
-    float* refined_delay_s,
-    float* refined_freq_hz)
-{
-    static constexpr int timing_offsets[] = {-4, 4, -8, 8};
-    static constexpr float frequency_offsets[] = {0.0f, -3.0f, 3.0f};
-
-    decode_status_t best_status = *status;
-    for (int timing_offset : timing_offsets)
-    {
-        for (float frequency_offset : frequency_offsets)
-        {
-            CostasCandidate trial = candidate;
-            trial.delay_s += (float)timing_offset / 250.0f;
-            trial.freq_hz += frequency_offset;
-
-            message_t trial_message = {0};
-            decode_status_t trial_status = {0};
-            uint8_t trial_plain174[FTX_LDPC_N];
-            float trial_delay_s = 0.0f;
-            float trial_freq_hz = 0.0f;
-            if (decode_ddc_residual_candidate_200(
-                    iq, iq_first_input, trial, ddc_lo_hz,
-                    &trial_message, &trial_status, trial_plain174,
-                    &trial_delay_s, &trial_freq_hz))
-            {
-                *message = trial_message;
-                *status = trial_status;
-                memcpy(plain174, trial_plain174, FTX_LDPC_N);
-                *refined_delay_s = trial_delay_s;
-                *refined_freq_hz = trial_freq_hz;
-                return true;
-            }
-            if (trial_status.ldpc_errors < best_status.ldpc_errors)
-                best_status = trial_status;
-        }
-    }
-    *status = best_status;
-    return false;
-}
-
 // ------------------------------------------------------------------------------------
 // Process "num_samples" samples stored in "signal"
 // ------------------------------------------------------------------------------------
 int process_buffer(float *samples,int sample_rate, int num_samples, 
-    bool is_ft8, int cand_to_subtract, float freq_hz_subtract, float time_delay_subtract, float base_freq, struct tm const *tmp, double sec){
+    bool is_ft8, int cand_to_subtract, float freq_hz_subtract, float time_delay_subtract, float base_freq, struct tm const *tmp, double sec, int max_decode_passes, bool is_early_pass, int max_candidates){
   assert(samples != NULL && tmp != NULL);
 
-  // This branch never mutates samples, so every stage can use this immutable
-  // view of the original mixture without an ESP32-S3-prohibitive RAM copy.
-  const float *const raw_samples = samples;
+#if defined(NATIVE_BUILD) && !defined(FT8_NATIVE_ALTERNATE_CANCEL)
+#define FT8_NATIVE_ALTERNATE_CANCEL 0
+#endif
+#if defined(NATIVE_BUILD) && FT8_NATIVE_ALTERNATE_CANCEL
+  float *const native_original = (float *)malloc((size_t)num_samples * sizeof(*samples));
+  if (native_original == NULL)
+    return -1;
+  memcpy(native_original, samples, (size_t)num_samples * sizeof(*samples));
+  const double primary_subtract_ramp = subtract_ramp;
+#endif
 
 
   // Compute Waterfall accumulation (FFT)
@@ -1067,8 +890,6 @@ int process_buffer(float *samples,int sample_rate, int num_samples,
         .protocol = is_ft8 ? PROTO_FT8 : PROTO_FT4
   };
 
-  monitor_t mon = {0};
-  
   // Hash table for decoded messages (to check for duplicates)
   int num_decoded = 0;
   // Pointer to kMax_decoded_messages-element array of message_t structures
@@ -1079,6 +900,19 @@ int process_buffer(float *samples,int sample_rate, int num_samples,
   decoded = (message_t *) calloc(sizeof(message_t), kMax_decoded_messages);
   // Pointer to kMax_decoded_messsages-element array of pointers to message_t structures
   decoded_hashtable = (message_t **) calloc(sizeof(message_t *), kMax_decoded_messages);
+
+#if defined(ARDUINO_ARCH_ESP32)
+  monitor_t* mon_ptr = acquire_embedded_monitor(&mon_cfg, num_samples);
+  if (mon_ptr == NULL) {
+    LOG(LOG_ERROR, "[ft8] monitor initialization failed\n");
+    free(decoded);
+    free(decoded_hashtable);
+    return -1;
+  }
+  monitor_t& mon = *mon_ptr;
+#else
+  monitor_t mon = {0};
+#endif
 
   // Initial waterfall and DDC-residual decodes share one result set.  This
   // prevents a residual alias from being reported as an additional message.
@@ -1097,7 +931,7 @@ int process_buffer(float *samples,int sample_rate, int num_samples,
       }
       idx_hash = (idx_hash + 1) % kMax_decoded_messages;
     }
-    LOG(LOG_WARN, "Decoded-message table is full; dropping [%s]\\n",
+    LOG(LOG_WARN, "[ft8] decoded-message table full; dropping text=%s\n",
         candidate.text);
     return false;
   };
@@ -1119,41 +953,56 @@ int process_buffer(float *samples,int sample_rate, int num_samples,
     return NULL;
   };
 
-  // A 250-Hz complex stream aliases signals separated by 250 Hz.  DDC bands
-  // overlap, so the same already-known message can otherwise be sent through
-  // the costly local DFT and LDPC decoder repeatedly under an alias.  The
-  // blind candidates are only 16 ms / 1 Hz coarse estimates, hence the
-  // deliberately wider-but-still-conservative matching tolerances below.
-  auto is_known_ddc_candidate = [&](const CostasCandidate& candidate,
-                                    float ddc_lo_hz) {
-    const float candidate_relative = remainderf(
-        candidate.freq_hz - ddc_lo_hz, 250.0f);
-    for (int i = 0; i < kMax_decoded_messages; ++i) {
-      const message_t* known = decoded_hashtable[i];
-      if (!known)
-        continue;
-      const float known_relative = remainderf(
-          known->freq_hz - ddc_lo_hz, 250.0f);
-      if (fabsf(candidate_relative - known_relative) > 2.0f)
-        continue;
-      // Waterfall candidates are timestamped one symbol after the actual
-      // FT8 start; DDC residual candidates use the start directly.
-      const float waterfall_start = known->time_sec - FT8_SYMBOL_PERIOD;
-      if (fabsf(candidate.delay_s - known->time_sec) < 0.060f ||
-          fabsf(candidate.delay_s - waterfall_start) < 0.060f)
-        return true;
-    }
-    return false;
-  };
-  
   // ---------------------------------------------------
   //  ONE PASS: standard waterfall decode followed by local DDC-SIC.
   //  Do not re-run a waterfall on a conventionally subtracted waveform.
   // ---------------------------------------------------
-  for(int pass=0; pass<1; ++pass){  
+  const int primary_passes =
+      (max_decode_passes > 0 && max_decode_passes < FT8_DECODE_PASSES)
+          ? max_decode_passes
+          : FT8_DECODE_PASSES;
+  const int total_passes = primary_passes
+#if defined(NATIVE_BUILD) && FT8_NATIVE_ALTERNATE_CANCEL
+      * 2
+#endif
+      ;
+
+  // This allocation needs a contiguous internal-DRAM block.  Reusing one
+  // monitor across passes avoids a second allocation failing after pass-0
+  // subtraction and other temporary allocations have fragmented the heap.
+#if !defined(ARDUINO_ARCH_ESP32)
+  monitor_init(&mon, &mon_cfg, num_samples);
+  if (mon.fft_cfg == NULL || mon.wf.mag == NULL) {
+    LOG(LOG_ERROR, "[ft8] monitor initialization failed\n");
+    monitor_free(&mon);
+    free(decoded);
+    free(decoded_hashtable);
+#if defined(NATIVE_BUILD) && FT8_NATIVE_ALTERNATE_CANCEL
+    subtract_ramp = primary_subtract_ramp;
+    free(native_original);
+#endif
+    return -1;
+  }
+#endif
+
+  for(int pass=0; pass<total_passes; ++pass){
+    const int decoded_before_pass = num_decoded;
+#if defined(NATIVE_BUILD) && FT8_NATIVE_ALTERNATE_CANCEL
+    const bool alternate_cancel = pass >= primary_passes;
+    const int branch_pass = pass % primary_passes;
+    if (pass == primary_passes) {
+      memcpy(samples, native_original, (size_t)num_samples * sizeof(*samples));
+      subtract_ramp = 0.22;
+    }
+#else
+    const bool alternate_cancel = false;
+    const int branch_pass = pass;
+#endif
+#if defined(NATIVE_DIAGNOSTIC)
     printf("========================================\n");
     printf("Starting pass %d\n", pass);
     printf("========================================\n");
+#endif
     
     struct timespec t_wf0 = {0};
     struct timespec t_wf1 = {0};
@@ -1167,65 +1016,66 @@ int process_buffer(float *samples,int sample_rate, int num_samples,
     
     clock_gettime(CLOCK_MONOTONIC, &t_wf0);
 
-    // Compute Waterfall accumulation (FFT)
-    monitor_config_t const mon_cfg = {
-            .f_min = 100,
-            .f_max = (sample_rate)/2.0f - 500.0f, // allow room for the receiver filter rolloff
-            .sample_rate = sample_rate,
-            .time_osr = FT8_TIME_OSR,
-            .freq_osr = FT8_FREQ_OSR,
-            .protocol = is_ft8 ? PROTO_FT8 : PROTO_FT4
-    };
-
-    monitor_init(&mon, &mon_cfg, num_samples);
-    LOG(LOG_DEBUG, "Waterfall allocated %d blocks of size %d\n", mon.wf.max_blocks, mon.block_size);
+    // Rebuild the waterfall from the current (possibly subtracted) waveform
+    // without reallocating the monitor's FFT storage.
+    monitor_reset(&mon);
+    LOG(LOG_DEBUG, "[ft8] stage=%s pass=%d waterfall start blocks=%d block_samples=%d\n",
+        is_early_pass ? "early" : "full", pass,
+        mon.wf.max_blocks, mon.block_size);
 
     for (int frame_pos = 0; frame_pos + mon.block_size <= num_samples; frame_pos += mon.block_size){
         // Process the waveform data frame by frame - you could have a live loop here with data from an audio device
         // (cool, now that we can get sample timings - KA9Q)
-        monitor_process(&mon, raw_samples + frame_pos);
+        monitor_process(&mon, samples + frame_pos);
     }
 
     clock_gettime(CLOCK_MONOTONIC, &t_wf1);
-    LOG(LOG_INFO, "Waterfall accumulation: %d blocks in %.3f ms  max magnitude %.1f dB\n", mon.wf.num_blocks, elapsed_ms(&t_wf0, &t_wf1), mon.max_mag);
+    LOG(LOG_INFO, "[ft8] stage=%s pass=%d waterfall blocks=%d elapsed=%.1fms max=%.1fdB\n",
+        is_early_pass ? "early" : "full", pass, mon.wf.num_blocks,
+        elapsed_ms(&t_wf0, &t_wf1), mon.max_mag);
     
     float const noise_power = estimate_global_noise_power(&mon.wf);
     
     // Find top candidates by Costas sync score and localize them in time and frequency
-    int const candidate_size = (mon_cfg.f_max * kMax_candidates) / 3000; // Scale by bandwidth relative to the original 3 kHz
+    int candidate_size = (mon_cfg.f_max * kMax_candidates) / 3000; // Scale by bandwidth relative to the original 3 kHz
+    if (max_candidates > 0 && candidate_size > max_candidates)
+      candidate_size = max_candidates;
     candidate_t candidate_list[candidate_size];
     int num_candidates = ft8_find_sync(&mon.wf, candidate_size, candidate_list, kMin_score);
-
     clock_gettime(CLOCK_MONOTONIC, &t_dec0);
-    LOG(LOG_INFO, "Found %d candidates with score from %d in %.3f milliseconds\n", num_candidates, kMin_score, elapsed_ms(&t_wf1, &t_dec0));
+    LOG(LOG_INFO, "[ft8] stage=%s pass=%d candidates=%d threshold=%d search=%.1fms\n",
+        is_early_pass ? "early" : "full", pass, num_candidates, kMin_score,
+        elapsed_ms(&t_wf1, &t_dec0));
 
     // ==================================================
     // Go over candidates and attempt to decode messages
     // ==================================================
     for (int idx = 0; idx < num_candidates; ++idx){
-    
         clock_gettime(CLOCK_MONOTONIC, &t_cand0);
-        const candidate_t* cand = &candidate_list[idx];
+        candidate_t localized_candidate = candidate_list[idx];
+        const candidate_t* cand = &localized_candidate;
         if (cand->score < kMin_score)
             continue;
 
         float const freq_hz = (cand->freq_offset + (float)cand->freq_sub / mon.wf.freq_osr) / mon.symbol_period;
         float const time_sec = (cand->time_offset + (float)cand->time_sub / mon.wf.time_osr) * mon.symbol_period;
-
         message_t message = {0};      // Written by ft8_decode()
         decode_status_t status = {0}; // ditto
         uint8_t plain174[FTX_LDPC_N];
-        if (!ft8_decode(&mon.wf, cand, &message, kLDPC_iterations, &status, plain174)){
-            // printf("000000 %3d %+4.2f %4.0f ~  ---\n", cand->score, time_sec, freq_hz);
+        const bool decoded_ok = ft8_decode(
+            &mon.wf, cand, &message, kLDPC_iterations, &status, plain174);
+        if (!decoded_ok){
             if (status.ldpc_errors > 0){
-            LOG(LOG_DEBUG, "LDPC decode: %d errors\n", status.ldpc_errors);
+            LOG(LOG_DEBUG, "[ft8] candidate=%d LDPC_errors=%d freq=%.1fHz time=%.3fs\n",
+                idx, status.ldpc_errors, freq_hz, time_sec);
             }else if (status.crc_calculated != status.crc_extracted){
-            LOG(LOG_DEBUG, "CRC mismatch!\n");
+            LOG(LOG_DEBUG, "[ft8] candidate=%d CRC mismatch\n", idx);
             }else if (status.unpack_status != 0){
-            LOG(LOG_DEBUG, "Error while unpacking!\n");
+            LOG(LOG_DEBUG, "[ft8] candidate=%d unpack failed\n", idx);
             }
             clock_gettime(CLOCK_MONOTONIC, &t_ndec);
-            LOG(LOG_DEBUG, "Decoding failed in %.3f milliseconds\n", elapsed_ms(&t_cand0, &t_ndec));
+            LOG(LOG_DEBUG, "[ft8] candidate=%d decode failed elapsed=%.1fms\n",
+                idx, elapsed_ms(&t_cand0, &t_ndec));
             continue;
         }
         
@@ -1243,585 +1093,111 @@ int process_buffer(float *samples,int sample_rate, int num_samples,
             message.snr_db = snr;
         }
 
-        LOG(LOG_DEBUG, "Checking decoded-message table for %4.1fs / %4.1fHz [%d]...\n", time_sec, freq_hz, cand->score);
-        if (store_decoded_message(message)){
+        LOG(LOG_DEBUG, "[ft8] candidate=%d dedup score=%d time=%.3fs freq=%.1fHz\n",
+            idx, cand->score, time_sec, freq_hz);
+        const bool newly_decoded = store_decoded_message(message);
+        if (newly_decoded){
             clock_gettime(CLOCK_MONOTONIC, &t_dec1);
-            LOG(LOG_INFO,"Decoded cand=%d score=%3d snr=%+.1f %+4.3f %4.3f ~  %s took %.3f msec\r\n", 
-                idx, cand->score, message.snr_db, time_sec-0.14f, freq_hz,
+            if (status.osd_score > 0.0f)
+                LOG(LOG_DEBUG, "[ft8] OSD accepted candidate=%d metric=%.3f\n", idx, status.osd_score);
+            LOG(LOG_DEBUG,"[ft8] decoded candidate=%d score=%d metric=%.3f snr=%+.1f dt=%+.3fs freq=%.1fHz text=%s decode=%.1fms\n",
+                idx, cand->score, status.codeword_metric, message.snr_db, time_sec-0.14f, freq_hz,
                 message.text, elapsed_ms(&t_cand0, &t_dec1));
-        
-            if(pass == 0){    
 
+            // Deliver each unique decode immediately. The cycle-complete
+            // callback below still flushes batched consumers only once after
+            // all decode/subtraction passes have finished.
+            if (should_emit_decoded_callback(tmp, message.text)) {
+              ft8_on_message_decoded(is_early_pass ? "early" : "final",
+                                     tmp, sec, base_freq, &message);
+            }
+
+            // A caller-supplied position overrides fine synchronization for
+            // one pass-0 candidate only.  It must not disable normal SIC for
+            // all the other messages, nor be reapplied to an unrelated
+            // candidate with the same index in a later residual pass.
+            const bool manual_coordinates =
+                cand_to_subtract >= 0 && pass == 0 && idx == cand_to_subtract;
+            const bool subtract_this_candidate = newly_decoded || alternate_cancel;
+
+            // On the alternate native branch, decode duplicates must still
+            // be cancelled because this branch starts from the original slot.
+            if (subtract_this_candidate &&
+                (branch_pass < primary_passes - 1)){
                 uint8_t tones[79];
                 get_ft8_tones_from_plain174(plain174, tones);
 
-                // DDC has its own Costas-based time/frequency refinement
-                // below.  Do not run the legacy wideband refiners or raw
-                // waveform RMS diagnostics here: their results were only
-                // printed and never influenced DDC cancellation or decode.
-
-                std::vector<IQ> ddc_output;
-
-                struct timespec ddc_t0;
-                struct timespec ddc_t1;
-
-                clock_gettime(CLOCK_MONOTONIC, &ddc_t0);
-
-                // Centre the complex DDC at this candidate's coarse frequency.
-                ddc_process_fast(
-                    freq_hz, raw_samples, num_samples, ddc_output);
-
-
-                clock_gettime(
-                    CLOCK_MONOTONIC,
-                    &ddc_t1);
-
-
-                const double ddc_time_ms =
-                    elapsed_ms(
-                        &ddc_t0,
-                        &ddc_t1);
-
-                LOG(LOG_DEBUG, "DDC processing took %.3f msec\r\n", ddc_time_ms);
-
-                // ------------------------------------------------------------
-                // DDC FINE FREQUENCY AND DELAY ESTIMATE
-                // ------------------------------------------------------------
-                float fine_freq_offset_hz = 0.0f;
-                float fine_time_offset_samp = 0.0f;
-                float coarse_delay_time_ms = 0.0f;
-                float fine_frequency_time_ms = 0.0f;
-                float fine_delay_time_ms = 0.0f;
-
-                struct timespec fine_sync_t0;
-                struct timespec fine_sync_t1;
-
-                clock_gettime(
-                    CLOCK_MONOTONIC,
-                    &fine_sync_t0);
-
-                /*
-                 * With the DDC LO at freq_hz, the base FT8 tone is at DC.
-                 * The Costas offsets are therefore the DFT bins directly.
-                 */
-                const int base_bin = 0;
-
-                constexpr float ddc_input_sample_rate = 12000.0f;
-                constexpr float ddc_output_sample_rate = 250.0f;
-                constexpr float ddc_decimation =
-                    ddc_input_sample_rate / ddc_output_sample_rate;
-                constexpr float ddc_fir_group_delay_samples = 60.0f;
-
-                /*
-                 * Candidate time points one FT8 symbol after the waveform
-                 * start.  Map the raw-input start to the causal FIR's output
-                 * coordinate, whose samples are delayed by 60 input samples.
-                 */
-                const float ddc_coarse_start_s =
-                    time_sec - mon.symbol_period;
-                const int ddc_start_output =
-                    static_cast<int>(std::lround(
-                        (ddc_coarse_start_s * ddc_input_sample_rate +
-                         ddc_fir_group_delay_samples) /
-                        ddc_decimation));
-                                
-                ddc_estimate_fine_sync(
-                    ddc_output,
-                    ddc_start_output,
-                    base_bin,
-                    COSTAS,
-                    COSTAS_LEN,
-                    COSTAS_START,
-                    3,
-                    &fine_freq_offset_hz,
-                    &fine_time_offset_samp,
-                    &coarse_delay_time_ms,
-                    &fine_frequency_time_ms,
-                    &fine_delay_time_ms);
-
-                clock_gettime(
-                    CLOCK_MONOTONIC,
-                    &fine_sync_t1);
-
-                const float ddc_fine_freq_hz =
-                    freq_hz + fine_freq_offset_hz;
-                const float ddc_fine_delay_s =
-                    ((static_cast<float>(ddc_start_output) +
-                      fine_time_offset_samp) *
-                     ddc_decimation - ddc_fir_group_delay_samples) /
-                    ddc_input_sample_rate;
-
-                LOG(LOG_INFO,
-                    "DDC refine: freq=%.6f Hz (offset=%+.6f), "
-                    "delay=%.6f s (offset=%+.3f samples)\r\n",
-                    ddc_fine_freq_hz,
-                    fine_freq_offset_hz,
-                    ddc_fine_delay_s,
-                    fine_time_offset_samp);
-                LOG(LOG_DEBUG,
-                    "DDC estimator timing: search=%.3f ms, frequency=%.3f ms, delay=%.3f ms\r\n",
-                    coarse_delay_time_ms,
-                    fine_frequency_time_ms,
-                    fine_delay_time_ms);
-
-                // ------------------------------------------------------------
-                // DDC-IQ subtraction and blind Costas search
-                // ------------------------------------------------------------
-                // ddc_output[0] is the causal FIR output at raw sample zero,
-                // which represents input time -60 samples after group-delay
-                // correction.  Use that same coordinate for subtraction and
-                // for the blind residual search.
-                constexpr int ddc_iq_first_input = -60;
-                float ddc_rms_before = 0.0f;
-                float ddc_rms_after = 0.0f;
-                float ddc_rms_model = 0.0f;
-                float ddc_residual_projection_db = 0.0f;
-                struct timespec ddc_subtract_t0;
-                struct timespec ddc_subtract_t1;
-                clock_gettime(CLOCK_MONOTONIC, &ddc_subtract_t0);
-
-                const bool ddc_subtracted = subtract_ft8_message_200(
-                    ddc_output,
-                    ddc_iq_first_input,
-                    tones,
-                    ddc_fine_delay_s,
-                    ddc_fine_freq_hz,
-                    freq_hz,
-                    &ddc_rms_before,
-                    &ddc_rms_after,
-                    &ddc_rms_model,
-                    &ddc_residual_projection_db);
-
-                clock_gettime(CLOCK_MONOTONIC, &ddc_subtract_t1);
-
-                if (!ddc_subtracted)
-                {
-                    LOG(LOG_WARN,
-                        "DDC IQ subtraction skipped: message is outside the IQ window\r\n");
-                }
-                else
-                {
-
+                float subtract_freq;
+                float subtract_delay;
+                if (manual_coordinates) {
+                    subtract_freq = freq_hz_subtract;
+                    subtract_delay = time_delay_subtract;
                     LOG(LOG_DEBUG,
-                        "DDC IQ subtract: rms %.6f -> %.6f (model %.6f, residual projection %.2f dB) in %.3f ms\r\n",
-                        ddc_rms_before,
-                        ddc_rms_after,
-                        ddc_rms_model,
-                        ddc_residual_projection_db,
-                        elapsed_ms(&ddc_subtract_t0, &ddc_subtract_t1));
-
-                    // Search the complete nominal DDC passband around the
-                    // coarse tone.  Edge candidates may be attenuated by the
-                    // 80-Hz low-pass filter, but remain useful for testing.
-                    struct timespec ddc_blind_t0;
-                    struct timespec ddc_blind_t1;
-                    clock_gettime(CLOCK_MONOTONIC, &ddc_blind_t0);
-                    const std::vector<CostasCandidate> residual_candidates =
-                        find_costas_candidates_200(
-                            ddc_output,
-                            ddc_iq_first_input,
-                            freq_hz,
-                            freq_hz - 80.0f,
-                            freq_hz + 80.0f);
-                    clock_gettime(CLOCK_MONOTONIC, &ddc_blind_t1);
-
-                    LOG(LOG_INFO,
-                        "DDC residual Costas scan: %u candidates in %.3f ms\r\n",
-                        (unsigned)residual_candidates.size(),
-                        elapsed_ms(&ddc_blind_t0, &ddc_blind_t1));
-                    bool have_first_residual = false;
-                    uint8_t first_residual_plain174[FTX_LDPC_N] = {};
-                    float first_residual_delay_s = 0.0f;
-                    float first_residual_freq_hz = 0.0f;
-                    for (size_t candidate_index = 0;
-                         candidate_index < residual_candidates.size();
-                         ++candidate_index)
-                    {
-                        const CostasCandidate& residual =
-                            residual_candidates[candidate_index];
-                        if (is_known_ddc_candidate(residual, freq_hz))
-                        {
-                            LOG(LOG_DEBUG,
-                                "  DDC residual %u skipped: known alias\r\n",
-                                (unsigned)(candidate_index + 1));
-                            continue;
-                        }
-                        LOG(LOG_DEBUG,
-                            "  DDC residual %u: delay %.6f s, tone-0 %.3f Hz, score %.6g\r\n",
-                            (unsigned)(candidate_index + 1),
-                            residual.delay_s,
-                            residual.freq_hz,
-                            residual.score);
-
-                        message_t residual_message = {0};
-                        decode_status_t residual_status = {0};
-                        uint8_t residual_plain174[FTX_LDPC_N];
-                        float residual_fine_delay_s = 0.0f;
-                        float residual_fine_freq_hz = 0.0f;
-                        bool residual_decoded =
-                            decode_ddc_residual_candidate_200(
-                                ddc_output,
-                                ddc_iq_first_input,
-                                residual,
-                                freq_hz,
-                                &residual_message,
-                                &residual_status,
-                                residual_plain174,
-                                &residual_fine_delay_s,
-                                &residual_fine_freq_hz);
-                        if (!residual_decoded && candidate_index == 0)
-                        {
-                            residual_decoded = retry_ddc_residual_candidate_200(
-                                ddc_output, ddc_iq_first_input, residual,
-                                freq_hz, &residual_message, &residual_status,
-                                residual_plain174, &residual_fine_delay_s,
-                                &residual_fine_freq_hz);
-                        }
-                        if (residual_decoded)
-                        {
-                            residual_message.freq_hz = residual_fine_freq_hz;
-                            residual_message.time_sec = residual_fine_delay_s;
-                            residual_message.score = residual.score;
-                            message_t* previous =
-                                find_decoded_message(residual_message);
-                            float residual_snr_2500_db =
-                                previous ? previous->snr_db : NAN;
-                            if (!previous)
-                            {
-                                (void)estimate_ddc_snr_2500(
-                                    ddc_output, ddc_iq_first_input,
-                                    residual_plain174, residual_fine_delay_s,
-                                    residual_fine_freq_hz, freq_hz,
-                                    &residual_snr_2500_db);
-                                residual_message.snr_db =
-                                    residual_snr_2500_db;
-                            }
-                            const bool is_new_residual =
-                                store_decoded_message(residual_message);
-                            LOG(LOG_INFO,
-                                "    DDC residual decoded%s: snr2500=%+.1f dB, delay %.6f s, tone-0 %.6f Hz ~  %s\r\n",
-                                is_new_residual ? "" : " (duplicate)",
-                                residual_snr_2500_db,
-                                residual_fine_delay_s,
-                                residual_fine_freq_hz,
-                                residual_message.text);
-                            // Preserve the strongest decodable residual for
-                            // one cancellation/reacquisition iteration.
-                            if (!have_first_residual)
-                            {
-                                memcpy(first_residual_plain174,
-                                       residual_plain174,
-                                       sizeof(first_residual_plain174));
-                                first_residual_delay_s = residual_fine_delay_s;
-                                first_residual_freq_hz = residual_fine_freq_hz;
-                                have_first_residual = true;
-                            }
-                            // A stronger residual may be a second message or
-                            // an alias.  Keep checking this short candidate
-                            // list for weaker, distinct FT8 messages.
-                        }
-                        else
-                        {
-                            LOG(LOG_DEBUG,
-                                "    DDC residual decode failed: delay %.6f s, tone-0 %.6f Hz, LDPC errors %d\r\n",
-                                residual_fine_delay_s,
-                                residual_fine_freq_hz,
-                                residual_status.ldpc_errors);
-                        }
-                    }
-
-                    // Successive-interference cancellation is essential for
-                    // overlapping FT8 signals: e.g. after IK4LZH is removed,
-                    // remove JA1FWS OK2BV before attempting JA1FWS HA7CH.
-                    if (have_first_residual)
-                    {
-                        uint8_t first_residual_tones[79];
-                        get_ft8_tones_from_plain174(
-                            first_residual_plain174, first_residual_tones);
-                        if (subtract_ft8_message_200(
-                                ddc_output, ddc_iq_first_input,
-                                first_residual_tones,
-                                first_residual_delay_s,
-                                first_residual_freq_hz, freq_hz,
-                                nullptr, nullptr, nullptr, nullptr))
-                        {
-                            const std::vector<CostasCandidate> second_candidates =
-                                find_costas_candidates_200(
-                                    ddc_output, ddc_iq_first_input, freq_hz,
-                                    freq_hz - 80.0f, freq_hz + 80.0f);
-                            LOG(LOG_INFO,
-                                "DDC residual scan after subtracting %.3f Hz / %.3f s: %u candidates\r\n",
-                                first_residual_freq_hz,
-                                first_residual_delay_s,
-                                (unsigned)second_candidates.size());
-                            for (size_t second_index = 0;
-                                 second_index < second_candidates.size();
-                                 ++second_index)
-                            {
-                                const CostasCandidate& second =
-                                    second_candidates[second_index];
-                                if (is_known_ddc_candidate(second, freq_hz))
-                                {
-                                    LOG(LOG_DEBUG,
-                                        "  DDC residual SIC %u skipped: known alias\r\n",
-                                        (unsigned)(second_index + 1));
-                                    continue;
-                                }
-                                message_t second_message = {0};
-                                decode_status_t second_status = {0};
-                                uint8_t second_plain174[FTX_LDPC_N];
-                                float second_delay_s = 0.0f;
-                                float second_freq_hz = 0.0f;
-                                if (decode_ddc_residual_candidate_200(
-                                        ddc_output, ddc_iq_first_input,
-                                        second, freq_hz, &second_message,
-                                        &second_status, second_plain174,
-                                        &second_delay_s, &second_freq_hz))
-                                {
-                                    second_message.freq_hz = second_freq_hz;
-                                    second_message.time_sec = second_delay_s;
-                                    second_message.score = second.score;
-                                    message_t* previous =
-                                        find_decoded_message(second_message);
-                                    float second_snr_2500_db =
-                                        previous ? previous->snr_db : NAN;
-                                    if (!previous)
-                                    {
-                                        (void)estimate_ddc_snr_2500(
-                                            ddc_output, ddc_iq_first_input,
-                                            second_plain174, second_delay_s,
-                                            second_freq_hz, freq_hz,
-                                            &second_snr_2500_db);
-                                        second_message.snr_db =
-                                            second_snr_2500_db;
-                                    }
-                                    const bool is_new_residual =
-                                        store_decoded_message(second_message);
-                                    LOG(LOG_INFO,
-                                        "    DDC residual after cancellation%s: snr2500=%+.1f dB, delay %.6f s, tone-0 %.6f Hz ~  %s\r\n",
-                                        is_new_residual ? "" : " (duplicate)",
-                                        second_snr_2500_db,
-                                        second_delay_s, second_freq_hz,
-                                        second_message.text);
-                                }
-                            }
-                        }
-                    }
+                        "[ft8] manual subtract candidate=%d freq=%.3fHz delay=%.6fs\n",
+                        idx, subtract_freq, subtract_delay);
+                } else {
+                    // Refine the coarse waterfall hypothesis against the
+                    // current residual before synthesizing and subtracting it.
+                    refine_ft8_joint(samples, num_samples, sample_rate, tones,
+                                     time_sec - 0.14f, freq_hz, idx,
+                                     &subtract_delay, &subtract_freq);
                 }
-                LOG(LOG_DEBUG, "Fine sync processing took %.3f msec\r\n", elapsed_ms(&fine_sync_t0, &fine_sync_t1));
 
-                // No wideband subtract() here.  Cancellation is confined to
-                // ddc_output, so later candidates always start from the
-                // immutable raw waveform above.
+                subtract(tones,
+                    subtract_freq,
+                    subtract_freq,
+                    subtract_delay,
+                    samples,
+                    num_samples,
+                    sample_rate);
             }
         }
         clock_gettime(CLOCK_MONOTONIC, &t_cand1);
-        LOG(LOG_DEBUG, "End of processing cand %d. It took %.3f msec\n", idx, elapsed_ms(&t_cand0, &t_cand1));
+        LOG(LOG_DEBUG, "[ft8] candidate=%d complete elapsed=%.1fms\n",
+            idx, elapsed_ms(&t_cand0, &t_cand1));
     }
     
     clock_gettime(CLOCK_MONOTONIC, &t_dec1);
-    LOG(LOG_INFO, "Pass %d: decoded %d messages on %d candidates, in %.3f ms\n", pass, num_decoded, num_candidates, elapsed_ms(&t_dec0, &t_dec1));
+    LOG(LOG_INFO,
+        "[ft8] stage=%s pass=%d candidates=%d new=%d total=%d decode=%.1fms\n",
+        is_early_pass ? "early" : "full", pass, num_candidates,
+        num_decoded - decoded_before_pass, num_decoded,
+        elapsed_ms(&t_dec0, &t_dec1));
     
 
-    // Decoded messages are spread throughout hash table, so sort the whole thing including null entries
-    // qsort(decoded_hashtable, kMax_decoded_messages, sizeof *decoded_hashtable, mcompare);
-    // Empty entries sorted to top, so first num_decoded elements of decoded_hashtable are valid
-    double tbase = tmp->tm_sec; // Full seconds and fraction in minute, should be just above (not below) period multiple
-    tbase = is_ft8 ? fmod(tbase,15.0) : fmod(tbase,7.5); // seconds after start of cycle (0/15/30/45 or 0/7.5/15/etc)
-    tbase += sec; // sec could be negative, so add it only now
-
-    // for(int i=0; i < num_decoded; i++){
-    //     message_t const *mp = decoded_hashtable[i];
-    //     if(mp == NULL)
-    //     continue; // Shouldn't happen
-    // }
-    monitor_free(&mon);
   } // End of pass
 
-  free(decoded);
-  free(decoded_hashtable);
-  return 0; // Caller frees signal
-}
-
-
-int process_buffer_ori(float const *signal,int sample_rate, int num_samples, bool is_ft8, float time_delay, struct tm const *tmp, double sec){
-  assert(signal != NULL && tmp != NULL);
-    
-  float * samples_ = (float *)signal;
-
-  struct timespec t_wf0 = {0};
-  struct timespec t_wf1 = {0};
-  struct timespec t_dec0 = {0};
-  struct timespec t_dec1 = {0};
-
-  clock_gettime(CLOCK_MONOTONIC, &t_wf0);
-
-  // Compute Waterfall accumulation (FFT)
-  monitor_t mon = {0};
-  monitor_config_t const mon_cfg = {
-    .f_min = 100,
-    .f_max = (sample_rate)/2.0f - 500.0f, // allow room for the receiver filter rolloff
-    .sample_rate = sample_rate,
-    .time_osr = kTime_osr,
-    .freq_osr = kFreq_osr,
-    .protocol = is_ft8 ? PROTO_FT8 : PROTO_FT4
-  };
-
-  monitor_init(&mon, &mon_cfg, num_samples);
-  LOG(LOG_DEBUG, "Waterfall allocated %d blocks of size %d\n", mon.wf.max_blocks, mon.block_size);
-  for (int frame_pos = 0; frame_pos + mon.block_size <= num_samples; frame_pos += mon.block_size){
-      // Process the waveform data frame by frame - you could have a live loop here with data from an audio device
-      // (cool, now that we can get sample timings - KA9Q)
-      monitor_process(&mon, signal + frame_pos);
-  }
-
- clock_gettime(CLOCK_MONOTONIC, &t_wf1);
-  LOG(LOG_INFO, "Waterfall accumulation: %d blocks in %.3f ms  max magnitude %.1f dB\n", mon.wf.num_blocks, elapsed_ms(&t_wf0, &t_wf1), mon.max_mag);
-  
-  float const noise_power = estimate_global_noise_power(&mon.wf);
-  
-  // Find top candidates by Costas sync score and localize them in time and frequency
-  int const candidate_size = (mon_cfg.f_max * kMax_candidates) / 3000; // Scale by bandwidth relative to the original 3 kHz
-  candidate_t candidate_list[candidate_size];
-  int num_candidates = ft8_find_sync(&mon.wf, candidate_size, candidate_list, kMin_score);
-
-  // Hash table for decoded messages (to check for duplicates)
-  int num_decoded = 0;
-  // Pointer to kMax_decoded_messages-element array of message_t structures
-  message_t *decoded = (message_t *) calloc(sizeof(message_t), kMax_decoded_messages);
-  // Pointer to kMax_decoded_messsages-element array of pointers to message_t structures
-  message_t **decoded_hashtable = (message_t **) calloc(sizeof(message_t *), kMax_decoded_messages);
-
-  clock_gettime(CLOCK_MONOTONIC, &t_dec0);
-  LOG(LOG_INFO, "Found %d candidates with score from %d in %.3f milliseconds\n", num_candidates, kMin_score, elapsed_ms(&t_wf1, &t_dec0));
-
-  // Go over candidates and attempt to decode messages
-  for (int idx = 0; idx < num_candidates; ++idx){
-      const candidate_t* cand = &candidate_list[idx];
-      if (cand->score < kMin_score)
-	      continue;
-
-      float const freq_hz = (cand->freq_offset + (float)cand->freq_sub / mon.wf.freq_osr) / mon.symbol_period;
-      float const time_sec = (cand->time_offset + (float)cand->time_sub / mon.wf.time_osr) * mon.symbol_period;
-
-      message_t message = {0}; // Written by ft8_decode()
-      decode_status_t status = {0}; // ditto
-      uint8_t plain174[FTX_LDPC_N];
-      if (!ft8_decode(&mon.wf, cand, &message, kLDPC_iterations, &status, plain174)){
-	      // printf("000000 %3d %+4.2f %4.0f ~  ---\n", cand->score, time_sec, freq_hz);
-        if (status.ldpc_errors > 0){
-          LOG(LOG_DEBUG, "LDPC decode: %d errors\n", status.ldpc_errors);
-        }else if (status.crc_calculated != status.crc_extracted){
-          LOG(LOG_DEBUG, "CRC mismatch!\n");
-        }else if (status.unpack_status != 0){
-          LOG(LOG_DEBUG, "Error while unpacking!\n");
-        }
-        continue;
-      }
-
-        message.freq_hz = freq_hz; // Save so we can sort on it and display it
-        message.time_sec = time_sec; // Time offset of start from nominal UTC :00/:15/:30/:45 or :00/:07.5/:15/...
-        message.score = cand->score;
-        message.snr_raw_db = estimate_candidate_snr_db_2500(&mon.wf, cand, plain174, noise_power);
-        {
-            // Affine calibration from raw estimator to WSJT-like displayed SNR.
-            float snr = FT8_SNR_RAW_SCALE * message.snr_raw_db + FT8_SNR_SCORE_SCALE * (float)message.score + FT8_SNR_OFFSET;
-            if (snr < FT8_SNR_MIN_DB)
-            snr = FT8_SNR_MIN_DB;
-            if (snr > FT8_SNR_MAX_DB)
-            snr = FT8_SNR_MAX_DB;
-            message.snr_db = snr;
-        }
-
-        LOG(LOG_DEBUG, "Checking hash table for %4.1fs / %4.1fHz [%d]...\n", time_sec, freq_hz, cand->score);
-        int idx_hash = message.hash % kMax_decoded_messages;
-        bool found_empty_slot = false;
-        bool found_duplicate = false;
-        do{
-            if (decoded_hashtable[idx_hash] == NULL){
-                LOG(LOG_DEBUG, "Found an empty slot\n");
-                found_empty_slot = true;
-            }else if ((decoded_hashtable[idx_hash]->hash == message.hash) && (0 == strcmp(decoded_hashtable[idx_hash]->text, message.text))){
-                LOG(LOG_DEBUG, "Found a duplicate [%s]\n", message.text);
-                found_duplicate = true;
-            }else{
-                LOG(LOG_DEBUG, "Hash table clash!\n");
-                // Move on to check the next entry in hash table
-                idx_hash = (idx_hash + 1) % kMax_decoded_messages;
-            }
-        } while (!found_empty_slot && !found_duplicate);
-
-        if (found_empty_slot){
-            // Fill the empty hashtable slot
-            decoded[idx_hash] = message;
-            decoded_hashtable[idx_hash] = &decoded[idx_hash];
-    
-            fprintf(stdout,"%4d/%02d/%02d %02d:%02d:%02d %3d %.3f %.6f %3d ~ %s\n",
-                tmp->tm_year + 1900,
-                tmp->tm_mon + 1,
-                tmp->tm_mday,
-                tmp->tm_hour,
-                tmp->tm_min,
-                tmp->tm_sec,
-                idx,
-                freq_hz,
-                time_sec,
-                (int)lroundf(message.snr_db),
-                message.text);
-            
-            ++num_decoded;
-
-            printf("DECODED: %3d %+4.2f %4.0f ~  %s\n", cand->score, time_sec, freq_hz, message.text);
-            uint8_t tones[79];
-            get_ft8_tones_from_plain174(plain174, tones);
-
-            float rms_before = rms(samples_, num_samples);
-    
-            printf("subtracting tones from waterfall... message.freq_hz=%.3f message.time_sec=%.6f num_samples=%d\n", 
-                    freq_hz, time_sec, num_samples);
-            
-            subtract(tones,
-                freq_hz,
-                freq_hz,
-                time_delay,
-                samples_,
-                num_samples,
-                sample_rate);
-            
-                printf("SUBTRACT: time=%.6f sec freq=%.3f Hz samples=%d sample_rate=%d\n",
-                time_delay,
-                freq_hz,
-                num_samples,
-                sample_rate);
-                
-            float rms_after = rms(samples_, num_samples);
-            double cancellation_db =
-                20.0 * std::log10(rms_before / rms_after);
-
-            printf("RMS before subtract = %.6f  after subtract = %.6f  ratio = %.3f dB\n", rms_before, rms_after, cancellation_db);
-        }
-  }
-  
-  clock_gettime(CLOCK_MONOTONIC, &t_dec1);
-  LOG(LOG_INFO, "On %d candidates, decoded %d messages in %.3f ms\n", num_candidates, num_decoded, elapsed_ms(&t_dec0, &t_dec1));
-  LOG(LOG_INFO, "Decoded %d messages\n", num_decoded);
-  
-  // Decoded messages are spread throughout hash table, so sort the whole thing including null entries
-  qsort(decoded_hashtable, kMax_decoded_messages, sizeof *decoded_hashtable, mcompare);
-  // Empty entries sorted to top, so first num_decoded elements of decoded_hashtable are valid
-  double tbase = tmp->tm_sec; // Full seconds and fraction in minute, should be just above (not below) period multiple
-  tbase = is_ft8 ? fmod(tbase,15.0) : fmod(tbase,7.5); // seconds after start of cycle (0/15/30/45 or 0/7.5/15/etc)
-  tbase += sec; // sec could be negative, so add it only now
-
-  for(int i=0; i < num_decoded; i++){
-    message_t const *mp = decoded_hashtable[i];
-    if(mp == NULL)
-      continue; // Shouldn't happen
-
-  }
-  free(decoded);
-  free(decoded_hashtable);
-
+#if !defined(ARDUINO_ARCH_ESP32)
   monitor_free(&mon);
-  return 0; // Caller frees signal
+#endif
+
+  // The result table is shared by both passes, so print once after all
+  // conventional and residual decodes have been deduplicated.
+  qsort(decoded_hashtable, kMax_decoded_messages, sizeof *decoded_hashtable, mcompare);
+  LOG(LOG_INFO, "[ft8] results stage=%s slot=%02d:%02d:%02d.%03d decoded=%d\n",
+      is_early_pass ? "early" : "full",
+      tmp->tm_hour, tmp->tm_min, tmp->tm_sec,
+      (int)lround(sec * 1000.0), num_decoded);
+  for (int i = 0; i < num_decoded; ++i) {
+    message_t const* mp = decoded_hashtable[i];
+    if (mp == NULL)
+      continue;
+    const int clock_seconds = decode_clock_seconds(tmp, mp->time_sec);
+    LOG_DECODED(
+        "[ft8] %02d%02d%02d snr=%+d dt=%+.2fs freq=%.1fHz text=%s%s\n",
+        clock_seconds / 3600, (clock_seconds / 60) % 60,
+        clock_seconds % 60, (int)lroundf(mp->snr_db),
+        mp->time_sec - 0.14f, mp->freq_hz, mp->text, log_color_reset());
+  }
+  if (!is_early_pass)
+    ft8_on_decode_cycle_complete();
+  fflush(stderr);
+
+  free(decoded);
+  free(decoded_hashtable);
+#if defined(NATIVE_BUILD) && FT8_NATIVE_ALTERNATE_CANCEL
+  subtract_ramp = primary_subtract_ramp;
+  free(native_original);
+#endif
+  return num_decoded; // Caller frees signal
 }
